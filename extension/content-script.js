@@ -1310,12 +1310,21 @@ async function scrapeRound() {
         // Wait for Street View to be ready
         await waitForStreetViewReady(signal, 6000);
 
-        // Wait a short moment for GeoPhotoService to capture coordinates
-        await sleep(200, signal);
+        // Wait for GeoPhotoService to capture coordinates
+        await sleep(500, signal);
 
-        // Send coordinates to backend if available
+        const roundId = `round-${currentRound}`;
+
+        // Send coordinates to backend FIRST so they're cached
         if (latestStreetViewMetadata?.lat != null && latestStreetViewMetadata?.lon != null) {
           try {
+            console.log("[GeoViz] Sending coords to backend:", {
+              lat: latestStreetViewMetadata.lat,
+              lon: latestStreetViewMetadata.lon,
+              country: latestStreetViewMetadata.country,
+              session_id: currentSessionId,
+              round_id: roundId,
+            });
             await sendMessageAsync({
               type: "SEND_COORDS",
               payload: {
@@ -1324,7 +1333,7 @@ async function scrapeRound() {
                 source: "scrape",
                 captured_at: new Date().toISOString(),
                 session_id: currentSessionId,
-                round_id: `round-${currentRound}`,
+                round_id: roundId,
                 round_index: currentRound,
                 metadata: {
                   country: latestStreetViewMetadata.country,
@@ -1333,12 +1342,16 @@ async function scrapeRound() {
                 },
               },
             });
+            // Small delay to ensure backend has cached the coords
+            await sleep(50, signal);
           } catch (coordError) {
             console.warn("[GeoViz] Failed to send coords:", coordError);
           }
+        } else {
+          console.warn("[GeoViz] No coordinates available from GeoPhotoService");
         }
 
-        // Save screenshot with coordinates metadata
+        // Save screenshot - backend will use cached coords
         await saveCurrentScreenshot({ silent: true });
 
         // Quick marker placement at map center
@@ -1658,28 +1671,125 @@ function parseGeoPhotoResponse(body) {
 
 function extractMetadataFromArray(data) {
   try {
+    // Try multiple extraction strategies
+    let lat = null;
+    let lon = null;
+    let address = null;
+    let photoId = null;
+
+    // Strategy 1: Standard GeoPhotoService structure
     const root = data?.[1]?.[0];
-    if (!root) return null;
-    const locationSets = root?.[5]?.[0]?.[1];
-    const primaryLocation = locationSets?.[0];
-    const lat = primaryLocation?.[2];
-    const lon = primaryLocation?.[3];
-  const addressBlock = root?.[3]?.[2];
-  const address = addressBlock?.map((entry) => entry?.[0]).filter(Boolean).join(", ");
-  const photoId = root?.[1]?.[1];
-  if (typeof lat !== "number" || typeof lon !== "number") return null;
-  const countryFromAddress = inferCountryFromAddress(address) ?? null;
-  return {
-    lat,
-    lon,
-    country: countryFromAddress,
-    address: address || null,
-    country_code: countryFromAddress,
-    photoId,
-  };
+    if (root) {
+      const locationSets = root?.[5]?.[0]?.[1];
+      const primaryLocation = locationSets?.[0];
+      if (primaryLocation) {
+        lat = primaryLocation?.[2];
+        lon = primaryLocation?.[3];
+      }
+      const addressBlock = root?.[3]?.[2];
+      if (Array.isArray(addressBlock)) {
+        address = addressBlock.map((entry) => entry?.[0]).filter(Boolean).join(", ");
+      }
+      photoId = root?.[1]?.[1];
+    }
+
+    // Strategy 2: Deep search for coordinates if not found
+    if (typeof lat !== "number" || typeof lon !== "number") {
+      const coords = findCoordinatesDeep(data);
+      if (coords) {
+        lat = coords.lat;
+        lon = coords.lon;
+      }
+    }
+
+    // Strategy 3: Look for address in alternate locations
+    if (!address) {
+      address = findAddressDeep(data);
+    }
+
+    if (typeof lat !== "number" || typeof lon !== "number") {
+      console.warn("[GeoViz] Could not extract coordinates from GeoPhotoService response");
+      return null;
+    }
+
+    const countryFromAddress = inferCountryFromAddress(address) ?? null;
+    console.log("[GeoViz] Extracted metadata:", { lat, lon, country: countryFromAddress, address });
+
+    return {
+      lat,
+      lon,
+      country: countryFromAddress,
+      address: address || null,
+      country_code: countryFromAddress,
+      photoId,
+    };
   } catch (error) {
+    console.error("[GeoViz] extractMetadataFromArray error:", error);
     return null;
   }
+}
+
+// Deep search for coordinates in nested structure
+function findCoordinatesDeep(node) {
+  let lat = null;
+  let lon = null;
+
+  function scan(value) {
+    if (lat !== null && lon !== null) return;
+    if (Array.isArray(value)) {
+      // Look for arrays with coordinates pattern [something, something, lat, lon, ...]
+      if (value.length >= 4 && typeof value[2] === "number" && typeof value[3] === "number") {
+        const possibleLat = value[2];
+        const possibleLon = value[3];
+        // Validate as coordinates
+        if (possibleLat >= -90 && possibleLat <= 90 && possibleLon >= -180 && possibleLon <= 180) {
+          lat = possibleLat;
+          lon = possibleLon;
+          return;
+        }
+      }
+      for (const entry of value) {
+        scan(entry);
+        if (lat !== null && lon !== null) return;
+      }
+    } else if (typeof value === "object" && value !== null) {
+      for (const key of Object.keys(value)) {
+        scan(value[key]);
+        if (lat !== null && lon !== null) return;
+      }
+    }
+  }
+
+  scan(node);
+  if (lat === null || lon === null) return null;
+  return { lat, lon };
+}
+
+// Deep search for address strings
+function findAddressDeep(node) {
+  let bestAddress = null;
+
+  function scan(value) {
+    if (Array.isArray(value)) {
+      // Look for string arrays that might be addresses
+      if (value.length >= 2 && typeof value[0] === "string" && typeof value[1] === "string") {
+        const text = value[0].trim();
+        const lang = value[1].toLowerCase();
+        // Address-like strings contain commas and are reasonable length
+        if (text.includes(",") && text.length >= 5 && text.length <= 200) {
+          if (!bestAddress || text.length > bestAddress.length) {
+            bestAddress = text;
+          }
+        }
+      }
+      for (const entry of value) scan(entry);
+    } else if (typeof value === "object" && value !== null) {
+      for (const key of Object.keys(value)) scan(value[key]);
+    }
+  }
+
+  scan(node);
+  return bestAddress;
 }
 
 function inferCountryFromAddress(address) {

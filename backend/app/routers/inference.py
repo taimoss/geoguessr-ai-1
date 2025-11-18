@@ -222,7 +222,26 @@ async def run_inference(
 @router.post("/screenshot", response_model=ScreenshotResponse, status_code=201)
 async def store_screenshot(payload: ScreenshotRequest) -> ScreenshotResponse:
     """Persist a screenshot without triggering inference."""
-    country_hint = extract_country_hint(payload.metadata)
+    # First check coords cache (populated by /v1/coords endpoint)
+    coords_hint = get_coords(payload.session_id, payload.round_id)
+    country_hint = coords_hint.get("country") if coords_hint else None
+
+    # Fallback to extracting from metadata
+    if not country_hint:
+        country_hint = extract_country_hint(payload.metadata)
+
+    # Last resort: try to get country from coordinates in metadata
+    if not country_hint and isinstance(payload.metadata, dict):
+        street_view = payload.metadata.get("street_view")
+        if isinstance(street_view, dict):
+            lat = street_view.get("lat")
+            lon = street_view.get("lon")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                country_hint = country_from_coords(lat, lon)
+
+    logger = logging.getLogger(__name__)
+    logger.info("Screenshot country hint: %s (coords_cache: %s)", country_hint, bool(coords_hint))
+
     try:
         screenshot_path = save_base64_image(
             payload.image_base64,
