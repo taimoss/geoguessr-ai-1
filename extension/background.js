@@ -138,7 +138,13 @@ const activeCaptureTabs = new Set(); // Set of tab IDs with active capture
 const geoRequestUrlById = new Map(); // requestId -> url
 const tabCoordinateSignatures = new Map(); // tabId -> last signature (prevents duplicates per tab)
 const tabMetadataCache = new Map(); // tabId -> latest metadata for this tab
+const tabLastCoordTime = new Map(); // tabId -> timestamp of last coordinate received
 const utf8Decoder = new TextDecoder("utf-8");
+
+// Health check interval (check every 30 seconds)
+const HEALTH_CHECK_INTERVAL_MS = 30000;
+// If no coords for this long, consider connection stale
+const STALE_CONNECTION_MS = 60000;
 
 function decodeBase64ToUtf8(body) {
   try {
@@ -273,6 +279,9 @@ async function emitGeoMetadata(tabId, metadata) {
   }
   tabCoordinateSignatures.set(tabId, signature);
 
+  // Track when we last received coordinates for this tab
+  tabLastCoordTime.set(tabId, Date.now());
+
   // Cache metadata for this specific tab
   tabMetadataCache.set(tabId, {
     ...metadata,
@@ -306,6 +315,7 @@ async function startGeoCapture(tabId) {
         if (chrome.runtime.lastError.message.includes("Another debugger")) {
           console.log(`[GeoViz] Tab ${tabId} debugger already attached`);
           activeCaptureTabs.add(tabId);
+          tabLastCoordTime.set(tabId, Date.now()); // Initialize
           resolve();
           return;
         }
@@ -319,12 +329,100 @@ async function startGeoCapture(tabId) {
         }
         activeCaptureTabs.add(tabId);
         tabCoordinateSignatures.delete(tabId); // Reset signature for fresh capture
+        tabLastCoordTime.set(tabId, Date.now()); // Initialize last coord time
         console.log(`[GeoViz] Geo capture started for tab ${tabId}. Active tabs: ${activeCaptureTabs.size}`);
         resolve();
       });
     });
   });
 }
+
+// Force reconnect debugger for a tab
+async function reconnectDebugger(tabId) {
+  console.log(`[GeoViz] Attempting to reconnect debugger for tab ${tabId}`);
+
+  // First try to detach (in case it's in a bad state)
+  try {
+    await new Promise((resolve) => {
+      chrome.debugger.detach({ tabId }, () => {
+        chrome.runtime.lastError; // Clear any error
+        resolve();
+      });
+    });
+  } catch (e) {
+    // Ignore detach errors
+  }
+
+  // Remove from active tabs
+  activeCaptureTabs.delete(tabId);
+  tabCoordinateSignatures.delete(tabId);
+
+  // Re-attach
+  try {
+    await startGeoCapture(tabId);
+    console.log(`[GeoViz] Successfully reconnected debugger for tab ${tabId}`);
+
+    // Notify content script that debugger was reconnected
+    chrome.tabs.sendMessage(tabId, {
+      type: "DEBUGGER_RECONNECTED"
+    }, () => chrome.runtime.lastError);
+
+    return true;
+  } catch (err) {
+    console.error(`[GeoViz] Failed to reconnect debugger for tab ${tabId}:`, err);
+    return false;
+  }
+}
+
+// Health check - verify debugger connections are still working
+async function performHealthCheck() {
+  if (activeCaptureTabs.size === 0) return;
+
+  const now = Date.now();
+  const tabsToReconnect = [];
+
+  for (const tabId of activeCaptureTabs) {
+    const lastCoordTime = tabLastCoordTime.get(tabId) || 0;
+    const timeSinceLastCoord = now - lastCoordTime;
+
+    // If no coordinates for too long, connection might be stale
+    if (timeSinceLastCoord > STALE_CONNECTION_MS) {
+      console.log(`[GeoViz] Tab ${tabId} has stale connection (${Math.round(timeSinceLastCoord/1000)}s since last coords)`);
+      tabsToReconnect.push(tabId);
+    }
+  }
+
+  // Reconnect stale tabs
+  for (const tabId of tabsToReconnect) {
+    await reconnectDebugger(tabId);
+  }
+}
+
+// Start health check interval
+let healthCheckInterval = null;
+
+function startHealthCheck() {
+  if (healthCheckInterval) return;
+
+  healthCheckInterval = setInterval(() => {
+    performHealthCheck().catch(err => {
+      console.error("[GeoViz] Health check error:", err);
+    });
+  }, HEALTH_CHECK_INTERVAL_MS);
+
+  console.log("[GeoViz] Health check started");
+}
+
+function stopHealthCheck() {
+  if (healthCheckInterval) {
+    clearInterval(healthCheckInterval);
+    healthCheckInterval = null;
+    console.log("[GeoViz] Health check stopped");
+  }
+}
+
+// Start health check when extension loads
+startHealthCheck();
 
 function stopGeoCapture(tabId = null) {
   return new Promise((resolve) => {
@@ -343,6 +441,7 @@ function stopGeoCapture(tabId = null) {
       activeCaptureTabs.delete(tabId);
       tabCoordinateSignatures.delete(tabId);
       tabMetadataCache.delete(tabId);
+      tabLastCoordTime.delete(tabId);
       console.log(`[GeoViz] Geo capture stopped for tab ${tabId}. Active tabs: ${activeCaptureTabs.size}`);
       resolve();
     });
@@ -469,6 +568,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender?.tab?.id;
     stopGeoCapture(tabId)
       .then(() => sendResponse({ success: true }))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "RECONNECT_DEBUGGER") {
+    const tabId = sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: "Kein Tab-Kontext verfügbar." });
+      return true;
+    }
+    reconnectDebugger(tabId)
+      .then((success) => sendResponse({ success }))
       .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }

@@ -104,6 +104,10 @@ const MAX_CONSECUTIVE_DUPLICATES = 3;
 let lastStreetViewChangeTime = Date.now();
 const LOADING_TIMEOUT_MS = 30000; // 30 seconds without change = stuck
 
+// Coordinate watchdog - detect when debugger stops sending coords
+let lastCoordinateTime = Date.now();
+const COORD_TIMEOUT_MS = 45000; // 45 seconds without new coords = stale
+
 // Simple hash function for image comparison
 function simpleImageHash(base64Data) {
   if (!base64Data || base64Data.length < 100) return null;
@@ -1559,6 +1563,17 @@ async function scrapeRound() {
         // Wait for debugger to capture coordinates
         await sleep(1500, signal);
 
+        // Check if coordinates are stale - debugger might have disconnected
+        if (areCoordinatesStale() && (scrapeActive || autoPlayActive)) {
+          console.warn("[GeoViz] Coordinates are stale - attempting debugger reconnection...");
+          updateStatus("Koordinaten veraltet - verbinde Debugger neu...");
+          const reconnected = await requestDebuggerReconnect();
+          if (reconnected) {
+            // Wait for new coordinates after reconnection
+            await sleep(2000, signal);
+          }
+        }
+
         const roundId = `round-${currentRound}`;
 
         // Send coordinates to backend FIRST so they're cached
@@ -1982,6 +1997,9 @@ function listenForDebuggerMetadata() {
       if (Number.isFinite(latValue) && Number.isFinite(lonValue)) {
         console.log("[GeoViz] Received debugger metadata:", latValue, lonValue, payload?.place);
 
+        // Update coordinate watchdog timestamp
+        lastCoordinateTime = Date.now();
+
         // Update latestStreetViewMetadata
         latestStreetViewMetadata = {
           lat: latValue,
@@ -2004,8 +2022,41 @@ function listenForDebuggerMetadata() {
         console.log("[GeoViz] Updated latestStreetViewMetadata:", latestStreetViewMetadata);
       }
     }
+
+    // Handle debugger reconnection notification
+    if (message?.type === "DEBUGGER_RECONNECTED") {
+      console.log("[GeoViz] Debugger was reconnected by background health check");
+      lastCoordinateTime = Date.now(); // Reset watchdog
+      updateStatus("Debugger neu verbunden");
+    }
+
     return false; // Don't send response
   });
+}
+
+// Check if coordinates are stale (debugger might be disconnected)
+function areCoordinatesStale() {
+  const timeSinceLastCoord = Date.now() - lastCoordinateTime;
+  return timeSinceLastCoord > COORD_TIMEOUT_MS;
+}
+
+// Request debugger reconnection
+async function requestDebuggerReconnect() {
+  console.log("[GeoViz] Requesting debugger reconnection...");
+  try {
+    const response = await sendMessageAsync({ type: "RECONNECT_DEBUGGER" });
+    if (response?.success) {
+      console.log("[GeoViz] Debugger reconnected successfully");
+      lastCoordinateTime = Date.now();
+      return true;
+    } else {
+      console.warn("[GeoViz] Debugger reconnection failed:", response?.error);
+      return false;
+    }
+  } catch (err) {
+    console.error("[GeoViz] Error reconnecting debugger:", err);
+    return false;
+  }
 }
 
 if (window.top === window) {
