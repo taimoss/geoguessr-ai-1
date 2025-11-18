@@ -1307,11 +1307,21 @@ async function scrapeRound() {
         currentPrediction = null;
         updateResult(null);
 
+        // IMPORTANT: Reset metadata for fresh capture
+        latestStreetViewMetadata = null;
+        lastProcessedPhotoId = null;
+
         // Wait for Street View to be ready
         await waitForStreetViewReady(signal, 6000);
 
-        // Wait for GeoPhotoService to capture coordinates
-        await sleep(500, signal);
+        // Wait for GeoPhotoService to capture NEW coordinates
+        await sleep(800, signal);
+
+        // Check if we got new coordinates
+        if (!latestStreetViewMetadata || latestStreetViewMetadata.lat == null) {
+          console.warn("[GeoViz] No new coordinates captured, waiting longer...");
+          await sleep(500, signal);
+        }
 
         const roundId = `round-${currentRound}`;
 
@@ -1549,37 +1559,75 @@ function startNewGameMonitor() {
     // Only act if auto-play or scrape is active
     if (!autoPlayActive && !scrapeActive) return;
 
-    // First check for "View Results" button and click it
-    for (const selector of SELECTORS.viewResultsButtons) {
+    // First check for "View Results" / "Close" button and click it
+    const viewResultsSelectors = [
+      ...SELECTORS.viewResultsButtons,
+      "button[data-qa='close-round-result']",
+      "[data-qa='close-round-result']",
+      "button[class*='close']",
+      "[aria-label*='close' i]",
+      "[aria-label*='View' i]",
+    ];
+    for (const selector of viewResultsSelectors) {
       const viewResultsBtn = document.querySelector(selector);
-      if (viewResultsBtn) {
-        console.log("[GeoViz] View Results button detected, clicking...");
+      if (viewResultsBtn && viewResultsBtn.offsetParent !== null) {
+        console.log("[GeoViz] View Results button detected:", selector);
         viewResultsBtn.click();
-        return; // Wait for next interval to check for play again
+        return;
       }
     }
     // Also check by text
-    const viewResultsText = queryButtonByText(["view results"]);
-    if (viewResultsText) {
-      console.log("[GeoViz] View Results button (by text) detected, clicking...");
+    const viewResultsText = queryButtonByText(["view results", "close", "continue"]);
+    if (viewResultsText && viewResultsText.offsetParent !== null) {
+      console.log("[GeoViz] View Results button (by text) detected");
       viewResultsText.click();
       return;
     }
 
-    // Then check for "Play Again" button
-    const playAgainButton = findPlayAgainButton();
-    if (playAgainButton) {
-      console.log("[GeoViz] Play Again button detected, starting new game...");
-      playAgainButton.click();
-      // Reset round counter for new game
+    // Then check for "Play Again" button with extended selectors
+    const playAgainSelectors = [
+      ...SELECTORS.playAgainButtons,
+      "button[data-qa='play-again-button']",
+      "a[data-qa='play-again']",
+      "a[href*='play-again']",
+      "[data-qa*='again']",
+      "[data-qa*='next']",
+      "button[class*='again']",
+      "button[class*='playAgain']",
+    ];
+
+    for (const selector of playAgainSelectors) {
+      const btn = document.querySelector(selector);
+      if (btn && btn.offsetParent !== null) {
+        console.log("[GeoViz] Play Again button detected:", selector);
+        btn.click();
+        // Reset for new game
+        currentRound = 1;
+        updateRoundInput();
+        lastGuessCoordinates = null;
+        latestStreetViewMetadata = null;
+        currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+        const sessionInput = document.getElementById("geoviz-session");
+        if (sessionInput) sessionInput.value = currentSessionId;
+        return;
+      }
+    }
+
+    // Also check by text for play again
+    const playAgainText = queryButtonByText(["play again", "play next", "new game", "another game"]);
+    if (playAgainText && playAgainText.offsetParent !== null) {
+      console.log("[GeoViz] Play Again button (by text) detected");
+      playAgainText.click();
+      // Reset for new game
       currentRound = 1;
       updateRoundInput();
       lastGuessCoordinates = null;
+      latestStreetViewMetadata = null;
       currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
       const sessionInput = document.getElementById("geoviz-session");
       if (sessionInput) sessionInput.value = currentSessionId;
     }
-  }, 300);
+  }, 200);
 }
 
 function stopNewGameMonitor() {
