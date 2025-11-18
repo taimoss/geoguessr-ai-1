@@ -1526,7 +1526,7 @@ function monitorResultPanels() {
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
-// Continuous monitor for "New Game" button to enable endless loop
+// Continuous monitor for "View Results" and "Play Again" buttons to enable endless loop
 let newGameMonitorInterval = null;
 
 function startNewGameMonitor() {
@@ -1536,15 +1536,37 @@ function startNewGameMonitor() {
     // Only act if auto-play or scrape is active
     if (!autoPlayActive && !scrapeActive) return;
 
-    const playAgainButton = findPlayAgainButton();
-    if (playAgainButton) {
-      // Check if we're at the end of a game (round 5 completed)
-      if (currentRound >= ROUND_LIMIT) {
-        console.log("[GeoViz] New Game button detected, starting new game...");
-        playAgainButton.click();
+    // First check for "View Results" button and click it
+    for (const selector of SELECTORS.viewResultsButtons) {
+      const viewResultsBtn = document.querySelector(selector);
+      if (viewResultsBtn) {
+        console.log("[GeoViz] View Results button detected, clicking...");
+        viewResultsBtn.click();
+        return; // Wait for next interval to check for play again
       }
     }
-  }, 500);
+    // Also check by text
+    const viewResultsText = queryButtonByText(["view results"]);
+    if (viewResultsText) {
+      console.log("[GeoViz] View Results button (by text) detected, clicking...");
+      viewResultsText.click();
+      return;
+    }
+
+    // Then check for "Play Again" button
+    const playAgainButton = findPlayAgainButton();
+    if (playAgainButton) {
+      console.log("[GeoViz] Play Again button detected, starting new game...");
+      playAgainButton.click();
+      // Reset round counter for new game
+      currentRound = 1;
+      updateRoundInput();
+      lastGuessCoordinates = null;
+      currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+      const sessionInput = document.getElementById("geoviz-session");
+      if (sessionInput) sessionInput.value = currentSessionId;
+    }
+  }, 300);
 }
 
 function stopNewGameMonitor() {
