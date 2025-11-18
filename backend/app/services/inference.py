@@ -40,10 +40,12 @@ class GeoModelClient:
         self,
         endpoint: Optional[str] = None,
         api_key: Optional[str] = None,
-        model_version: str = "geovit-tinyvit-21m-v0",
+        model_version: str = "geoviz-convnext-tiny-v1",
         timeout_seconds: float | None = None,
         checkpoint_path: Optional[str] = None,
         classes_path: Optional[str] = None,
+        image_size: int = 384,
+        model_name: str = "convnext_tiny",
     ) -> None:
         self.endpoint = endpoint or os.getenv("MODEL_ENDPOINT")
         self.api_key = api_key or os.getenv("MODEL_API_KEY")
@@ -51,6 +53,8 @@ class GeoModelClient:
         self.timeout_seconds = timeout_seconds or float(os.getenv("MODEL_TIMEOUT", "10"))
         self.checkpoint_path = checkpoint_path or os.getenv("MODEL_CHECKPOINT")
         self.classes_path = classes_path or os.getenv("MODEL_CLASSES_PATH")
+        self.image_size = int(os.getenv("MODEL_IMAGE_SIZE", str(image_size)))
+        self.model_name = os.getenv("MODEL_NAME", model_name)
         self._local_model = None
         self._local_transform = None
         self._local_class_names: list[str] = []
@@ -136,18 +140,24 @@ class GeoModelClient:
         if not self.checkpoint_path:
             raise RuntimeError("MODEL_CHECKPOINT not configured.")
         print(f"[GeoModelClient] Loading local model from {self.checkpoint_path}")
+        print(f"[GeoModelClient] Model: {self.model_name} | Image size: {self.image_size}px")
         self._local_model = timm.create_model(
-            "tiny_vit_21m_224",
+            self.model_name,
             pretrained=False,
             num_classes=self._load_class_count(),
         )
         state = torch.load(self.checkpoint_path, map_location="cpu")
         self._local_model.load_state_dict(state)
         self._local_model.to(self._local_device).eval()
+        # Use ImageNet normalization (must match training transforms)
         self._local_transform = transforms.Compose(
             [
-                transforms.Resize((224, 224)),
+                transforms.Resize((self.image_size, self.image_size)),
                 transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
             ]
         )
 

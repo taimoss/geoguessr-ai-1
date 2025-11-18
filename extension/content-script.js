@@ -92,6 +92,9 @@ let lastProcessedPhotoId = null;
 const roundMetadata = new Map();
 let screenshotApiAvailable = true;
 
+// Unique tab identifier for multi-tab isolation
+const TAB_INSTANCE_ID = `tab-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, ms);
@@ -800,7 +803,8 @@ async function getConfig() {
   if (!response?.success) throw new Error(response?.error || "Konnte Config nicht laden.");
   extensionConfig = response.config;
   if (!currentSessionId) {
-    currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+    // Include TAB_INSTANCE_ID for multi-tab isolation
+    currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
     const sessionInput = document.getElementById("geoviz-session");
     if (sessionInput) sessionInput.value = currentSessionId;
   }
@@ -879,7 +883,8 @@ async function ensureSessionDefaults() {
   if (!extensionConfig.sessionPrefix) {
     extensionConfig.sessionPrefix = "chrome-session";
   }
-  currentSessionId = `${extensionConfig.sessionPrefix}-${Date.now()}`;
+  // Include TAB_INSTANCE_ID for multi-tab isolation
+  currentSessionId = `${extensionConfig.sessionPrefix}-${TAB_INSTANCE_ID}-${Date.now()}`;
   const sessionInput = document.getElementById("geoviz-session");
   if (sessionInput) sessionInput.value = currentSessionId;
 }
@@ -1273,7 +1278,8 @@ async function startNextGame(signal) {
   currentRound = 1;
   updateRoundInput();
   lastGuessCoordinates = null;
-  currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+  // Include TAB_INSTANCE_ID for multi-tab isolation
+  currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
   const sessionInput = document.getElementById("geoviz-session");
   if (sessionInput) sessionInput.value = currentSessionId;
 }
@@ -1284,6 +1290,95 @@ async function waitForStreetViewReady(signal, timeout = 15000) {
 
 let scrapeActive = false;
 let scrapeAbortController = null;
+
+// Keep-alive mechanism to prevent tab throttling and black images
+let keepAliveAudioContext = null;
+let keepAliveInterval = null;
+let wakeLock = null;
+
+async function startKeepAlive() {
+  if (keepAliveInterval) return;
+
+  // Method 1: Silent audio context keeps tab active
+  try {
+    keepAliveAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = keepAliveAudioContext.createOscillator();
+    const gainNode = keepAliveAudioContext.createGain();
+    gainNode.gain.value = 0.001; // Nearly silent
+    oscillator.connect(gainNode);
+    gainNode.connect(keepAliveAudioContext.destination);
+    oscillator.start();
+    console.log("[GeoViz] Keep-alive audio context started");
+  } catch (err) {
+    console.warn("[GeoViz] Could not create audio context:", err);
+  }
+
+  // Method 2: Screen Wake Lock API (if available)
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      console.log("[GeoViz] Screen wake lock acquired");
+      wakeLock.addEventListener('release', () => {
+        console.log("[GeoViz] Wake lock released, attempting to reacquire...");
+        if (scrapeActive || autoPlayActive) {
+          navigator.wakeLock.request('screen').then(lock => {
+            wakeLock = lock;
+          }).catch(() => {});
+        }
+      });
+    }
+  } catch (err) {
+    console.warn("[GeoViz] Could not acquire wake lock:", err);
+  }
+
+  // Method 3: Periodic activity to prevent throttling
+  keepAliveInterval = setInterval(() => {
+    if (!scrapeActive && !autoPlayActive) {
+      stopKeepAlive();
+      return;
+    }
+
+    // Force browser to consider tab active
+    if (keepAliveAudioContext?.state === 'suspended') {
+      keepAliveAudioContext.resume().catch(() => {});
+    }
+
+    // Trigger minimal DOM read to keep tab responsive
+    const _ = document.hidden;
+  }, 5000);
+
+  // Handle visibility changes
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+}
+
+function handleVisibilityChange() {
+  if (document.hidden && (scrapeActive || autoPlayActive)) {
+    console.log("[GeoViz] Tab hidden but scrape active - maintaining keep-alive");
+    if (keepAliveAudioContext?.state === 'suspended') {
+      keepAliveAudioContext.resume().catch(() => {});
+    }
+  }
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+
+  if (keepAliveAudioContext) {
+    keepAliveAudioContext.close().catch(() => {});
+    keepAliveAudioContext = null;
+  }
+
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
+  console.log("[GeoViz] Keep-alive stopped");
+}
 
 async function scrapeRound() {
   if (autoPlayActive) {
@@ -1297,6 +1392,18 @@ async function scrapeRound() {
   scrapeActive = true;
   scrapeAbortController = new AbortController();
   const { signal } = scrapeAbortController;
+
+  // Start keep-alive to prevent black images
+  await startKeepAlive();
+
+  // Start geo capture debugger for this tab
+  try {
+    await sendMessageAsync({ type: "START_GEO_CAPTURE" });
+    console.log("[GeoViz] Geo capture started for this tab");
+  } catch (err) {
+    console.warn("[GeoViz] Could not start geo capture:", err);
+  }
+
   updateStatus("Scrape gestartet - laeuft endlos.");
   const buttons = document.querySelectorAll("#geoviz-scrape");
   buttons.forEach((btn) => (btn.textContent = "Stop Scrape"));
@@ -1308,14 +1415,29 @@ async function scrapeRound() {
         updateResult(null);
 
         // Wait for Street View to be ready
-        await waitForStreetViewReady(signal, 6000);
+        try {
+          await waitForStreetViewReady(signal, 10000);
+        } catch (err) {
+          console.warn("[GeoViz] Street View not ready, retrying...");
+          await sleep(1000, signal).catch(() => {});
+          continue;
+        }
 
-        // Wait a short moment for GeoPhotoService to capture coordinates
-        await sleep(200, signal);
+        // Wait for debugger to capture coordinates
+        await sleep(1500, signal);
 
-        // Send coordinates to backend if available
+        const roundId = `round-${currentRound}`;
+
+        // Send coordinates to backend FIRST so they're cached
         if (latestStreetViewMetadata?.lat != null && latestStreetViewMetadata?.lon != null) {
           try {
+            console.log("[GeoViz] Sending coords to backend:", {
+              lat: latestStreetViewMetadata.lat,
+              lon: latestStreetViewMetadata.lon,
+              country: latestStreetViewMetadata.country,
+              session_id: currentSessionId,
+              round_id: roundId,
+            });
             await sendMessageAsync({
               type: "SEND_COORDS",
               payload: {
@@ -1324,7 +1446,7 @@ async function scrapeRound() {
                 source: "scrape",
                 captured_at: new Date().toISOString(),
                 session_id: currentSessionId,
-                round_id: `round-${currentRound}`,
+                round_id: roundId,
                 round_index: currentRound,
                 metadata: {
                   country: latestStreetViewMetadata.country,
@@ -1333,31 +1455,53 @@ async function scrapeRound() {
                 },
               },
             });
+            // Small delay to ensure backend has cached the coords
+            await sleep(50, signal);
           } catch (coordError) {
             console.warn("[GeoViz] Failed to send coords:", coordError);
           }
+        } else {
+          console.warn("[GeoViz] No coordinates available - continuing anyway");
         }
 
-        // Save screenshot with coordinates metadata
-        await saveCurrentScreenshot({ silent: true });
+        // Save screenshot - backend will use cached coords
+        try {
+          await saveCurrentScreenshot({ silent: true });
+        } catch (err) {
+          console.warn("[GeoViz] Screenshot failed:", err);
+        }
 
         // Quick marker placement at map center
-        await placeMarkerAtMapCenter(signal);
+        try {
+          await placeMarkerAtMapCenter(signal);
+        } catch (err) {
+          console.warn("[GeoViz] Marker placement failed:", err);
+        }
 
         // Submit guess quickly
-        await submitGuess(signal);
+        try {
+          await submitGuess(signal);
+        } catch (err) {
+          console.warn("[GeoViz] Submit guess failed:", err);
+          await sleep(500, signal).catch(() => {});
+          continue;
+        }
 
         // Wait for result
         await waitForRoundResult(signal, currentRound - 1);
 
-        // Transition to next round/game
-        try {
-          await handleResultTransition(currentRound >= ROUND_LIMIT, signal);
-        } catch (error) {
-          console.warn("[GeoViz] Scrape transition failed", error);
+        // Increment round counter
+        currentRound += 1;
+        if (currentRound > ROUND_LIMIT) {
+          currentRound = 1;
         }
+        updateRoundInput();
 
-        updateStatus(`Scrape: Runde ${currentRound} abgeschlossen.`);
+        updateStatus(`Scrape: Runde ${currentRound - 1} abgeschlossen.`);
+
+        // Small delay before next round
+        await sleep(500, signal).catch(() => {});
+
       } catch (error) {
         if (signal.aborted) break;
         console.warn("[GeoViz] Scrape failed", error);
@@ -1367,7 +1511,7 @@ async function scrapeRound() {
           return;
         }
         updateStatus(`${STATUS_ERROR}${message}`);
-        await sleep(200, signal).catch(() => {});
+        await sleep(1000, signal).catch(() => {});
       }
     }
     stopScrape(false);
@@ -1379,6 +1523,13 @@ function stopScrape(updateStatusText = true) {
   scrapeActive = false;
   scrapeAbortController?.abort();
   scrapeAbortController = null;
+
+  // Stop keep-alive
+  stopKeepAlive();
+
+  // Stop geo capture for this tab
+  sendMessageAsync({ type: "STOP_GEO_CAPTURE" }).catch(() => {});
+
   const buttons = document.querySelectorAll("#geoviz-scrape");
   buttons.forEach((btn) => (btn.textContent = "Scrape"));
   if (updateStatusText) {
@@ -1464,11 +1615,23 @@ async function autoPlayLoop(signal) {
   }
 }
 
-function startAutoPlay() {
+async function startAutoPlay() {
   if (autoPlayActive) return;
   autoPlayActive = true;
   updateAutoButton();
   updateStatus("Auto Play aktiviert – Spiel startet automatisch.");
+
+  // Start keep-alive to prevent black images
+  await startKeepAlive();
+
+  // Start geo capture debugger for this tab
+  try {
+    await sendMessageAsync({ type: "START_GEO_CAPTURE" });
+    console.log("[GeoViz] Geo capture started for auto play");
+  } catch (err) {
+    console.warn("[GeoViz] Could not start geo capture:", err);
+  }
+
   autoPlayAbortController = new AbortController();
   autoPlayLoop(autoPlayAbortController.signal);
   sendMessageAsync({
@@ -1484,6 +1647,13 @@ function stopAutoPlay(persist = true) {
   updateStatus("Auto Play gestoppt.");
   autoPlayAbortController?.abort();
   autoPlayAbortController = null;
+
+  // Stop keep-alive
+  stopKeepAlive();
+
+  // Stop geo capture for this tab
+  sendMessageAsync({ type: "STOP_GEO_CAPTURE" }).catch(() => {});
+
   if (persist) {
     sendMessageAsync({
       type: "SAVE_CONFIG",
@@ -1526,7 +1696,7 @@ function monitorResultPanels() {
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
-// Continuous monitor for "New Game" button to enable endless loop
+// Continuous monitor for "View Results" and "Play Again" buttons to enable endless loop
 let newGameMonitorInterval = null;
 
 function startNewGameMonitor() {
@@ -1536,15 +1706,66 @@ function startNewGameMonitor() {
     // Only act if auto-play or scrape is active
     if (!autoPlayActive && !scrapeActive) return;
 
-    const playAgainButton = findPlayAgainButton();
-    if (playAgainButton) {
-      // Check if we're at the end of a game (round 5 completed)
-      if (currentRound >= ROUND_LIMIT) {
-        console.log("[GeoViz] New Game button detected, starting new game...");
-        playAgainButton.click();
+    // Check for "Play Again" button FIRST (higher priority)
+    const playAgainSelectors = [
+      "button[data-qa='play-again-button']",
+      ...SELECTORS.playAgainButtons,
+      "a[data-qa='play-again']",
+      "a[href*='play-again']",
+      "[data-qa*='play-again']",
+      "button[class*='playAgain']",
+    ];
+
+    for (const selector of playAgainSelectors) {
+      const btn = document.querySelector(selector);
+      if (btn && btn.offsetParent !== null) {
+        console.log("[GeoViz] Play Again button detected:", selector);
+        btn.click();
+        // Reset for new game
+        currentRound = 1;
+        updateRoundInput();
+        lastGuessCoordinates = null;
+        latestStreetViewMetadata = null;
+        // Include TAB_INSTANCE_ID for multi-tab isolation
+        currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
+        const sessionInput = document.getElementById("geoviz-session");
+        if (sessionInput) sessionInput.value = currentSessionId;
+        return;
       }
     }
-  }, 500);
+
+    // Also check by text for play again
+    const playAgainText = queryButtonByText(["play again"]);
+    if (playAgainText && playAgainText.offsetParent !== null) {
+      console.log("[GeoViz] Play Again button (by text) detected");
+      playAgainText.click();
+      // Reset for new game
+      currentRound = 1;
+      updateRoundInput();
+      lastGuessCoordinates = null;
+      latestStreetViewMetadata = null;
+      // Include TAB_INSTANCE_ID for multi-tab isolation
+      currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
+      const sessionInput = document.getElementById("geoviz-session");
+      if (sessionInput) sessionInput.value = currentSessionId;
+      return;
+    }
+
+    // Then check for "View Results" / "Close" button (only specific selectors)
+    const viewResultsSelectors = [
+      "button[data-qa='close-round-result']",
+      "[data-qa='close-round-result']",
+      ...SELECTORS.viewResultsButtons,
+    ];
+    for (const selector of viewResultsSelectors) {
+      const viewResultsBtn = document.querySelector(selector);
+      if (viewResultsBtn && viewResultsBtn.offsetParent !== null) {
+        console.log("[GeoViz] View Results button detected:", selector);
+        viewResultsBtn.click();
+        return;
+      }
+    }
+  }, 200);
 }
 
 function stopNewGameMonitor() {
@@ -1562,7 +1783,45 @@ async function init() {
   monitorResultPanels();
   interceptGeoPhotoService();
   startNewGameMonitor();
+  listenForDebuggerMetadata();
   await getConfig();
+}
+
+// Listen for GEO_METADATA from background.js (debugger captures)
+function listenForDebuggerMetadata() {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "GEO_METADATA" && message?.payload) {
+      const payload = message.payload;
+      const latValue = Number(payload?.lat);
+      const lonValue = Number(payload?.lon);
+
+      if (Number.isFinite(latValue) && Number.isFinite(lonValue)) {
+        console.log("[GeoViz] Received debugger metadata:", latValue, lonValue, payload?.place);
+
+        // Update latestStreetViewMetadata
+        latestStreetViewMetadata = {
+          lat: latValue,
+          lon: lonValue,
+          address: payload?.place || null,
+          country: null,
+          country_code: null,
+          photoId: null,
+        };
+
+        // Try to infer country from place/address
+        if (payload?.place) {
+          const inferredCountry = inferCountryFromAddress(payload.place);
+          if (inferredCountry) {
+            latestStreetViewMetadata.country = inferredCountry;
+            latestStreetViewMetadata.country_code = inferredCountry;
+          }
+        }
+
+        console.log("[GeoViz] Updated latestStreetViewMetadata:", latestStreetViewMetadata);
+      }
+    }
+    return false; // Don't send response
+  });
 }
 
 if (window.top === window) {
@@ -1575,18 +1834,25 @@ function interceptGeoPhotoService() {
   if (window.__geovizFetchHooked) return;
   window.__geovizFetchHooked = true;
 
+  console.log("[GeoViz] Installing GeoPhotoService interceptors...");
+
   const originalFetch = window.fetch;
   window.fetch = async (...args) => {
     const response = await originalFetch(...args);
     const url = typeof args[0] === "string" ? args[0] : args[0]?.url;
-    if (url && url.includes("GeoPhotoService") && response.clone) {
-      const clone = response.clone();
-      clone
-        .text()
-        .then((body) => {
-          parseGeoPhotoResponse(body);
-        })
-        .catch(() => {});
+    if (url && (url.includes("GeoPhotoService") || url.includes("maps.googleapis.com"))) {
+      console.log("[GeoViz] Fetch intercepted:", url.substring(0, 100));
+      if (response.clone) {
+        const clone = response.clone();
+        clone
+          .text()
+          .then((body) => {
+            parseGeoPhotoResponse(body);
+          })
+          .catch((err) => {
+            console.warn("[GeoViz] Failed to read fetch response:", err);
+          });
+      }
     }
     return response;
   };
@@ -1602,62 +1868,197 @@ function interceptGeoPhotoService() {
       "load",
       () => {
         const url = this.__geovizUrl;
-        if (!url || !String(url).includes("GeoPhotoService")) return;
-        try {
-          parseGeoPhotoResponse(this.responseText);
-        } catch {
-          /* ignore */
+        if (!url) return;
+        if (url.includes("GeoPhotoService") || url.includes("maps.googleapis.com")) {
+          console.log("[GeoViz] XHR intercepted:", url.substring(0, 100));
+          try {
+            parseGeoPhotoResponse(this.responseText);
+          } catch (err) {
+            console.warn("[GeoViz] Failed to parse XHR response:", err);
+          }
         }
       },
       { once: true }
     );
     return originalSend.call(this, body);
   };
+
+  console.log("[GeoViz] GeoPhotoService interceptors installed");
 }
 
 function parseGeoPhotoResponse(body) {
+  if (!body) return;
+
+  let data = null;
+
+  // Try JSONP callback format first
   const callbackPrefix = "/**/_callbacks____";
-  if (!body || !body.startsWith(callbackPrefix)) return;
-  const start = body.indexOf("(");
-  const end = body.lastIndexOf(")");
-  if (start === -1 || end === -1) return;
-  const payload = body.slice(start + 1, end);
-  let data;
-  try {
-    data = JSON.parse(payload);
-  } catch (error) {
+  if (body.startsWith(callbackPrefix)) {
+    const start = body.indexOf("(");
+    const end = body.lastIndexOf(")");
+    if (start !== -1 && end !== -1) {
+      const payload = body.slice(start + 1, end);
+      try {
+        data = JSON.parse(payload);
+      } catch (error) {
+        console.warn("[GeoViz] Failed to parse JSONP callback:", error);
+      }
+    }
+  }
+
+  // Try raw JSON format
+  if (!data) {
+    try {
+      data = JSON.parse(body);
+    } catch {
+      // Not JSON, try to find JSON in the response
+      const jsonMatch = body.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        try {
+          data = JSON.parse(jsonMatch[0]);
+        } catch {
+          // Still no luck
+        }
+      }
+    }
+  }
+
+  if (!data) {
+    console.warn("[GeoViz] Could not parse GeoPhoto response");
     return;
   }
+
+  console.log("[GeoViz] Parsing GeoPhoto data...");
   const meta = extractMetadataFromArray(data);
   if (meta) {
+    console.log("[GeoViz] New coordinates captured:", meta.lat, meta.lon, meta.country);
     latestStreetViewMetadata = meta;
+  } else {
+    console.warn("[GeoViz] No metadata extracted from response");
   }
 }
 
 function extractMetadataFromArray(data) {
   try {
+    // Try multiple extraction strategies
+    let lat = null;
+    let lon = null;
+    let address = null;
+    let photoId = null;
+
+    // Strategy 1: Standard GeoPhotoService structure
     const root = data?.[1]?.[0];
-    if (!root) return null;
-    const locationSets = root?.[5]?.[0]?.[1];
-    const primaryLocation = locationSets?.[0];
-    const lat = primaryLocation?.[2];
-    const lon = primaryLocation?.[3];
-  const addressBlock = root?.[3]?.[2];
-  const address = addressBlock?.map((entry) => entry?.[0]).filter(Boolean).join(", ");
-  const photoId = root?.[1]?.[1];
-  if (typeof lat !== "number" || typeof lon !== "number") return null;
-  const countryFromAddress = inferCountryFromAddress(address) ?? null;
-  return {
-    lat,
-    lon,
-    country: countryFromAddress,
-    address: address || null,
-    country_code: countryFromAddress,
-    photoId,
-  };
+    if (root) {
+      const locationSets = root?.[5]?.[0]?.[1];
+      const primaryLocation = locationSets?.[0];
+      if (primaryLocation) {
+        lat = primaryLocation?.[2];
+        lon = primaryLocation?.[3];
+      }
+      const addressBlock = root?.[3]?.[2];
+      if (Array.isArray(addressBlock)) {
+        address = addressBlock.map((entry) => entry?.[0]).filter(Boolean).join(", ");
+      }
+      photoId = root?.[1]?.[1];
+    }
+
+    // Strategy 2: Deep search for coordinates if not found
+    if (typeof lat !== "number" || typeof lon !== "number") {
+      const coords = findCoordinatesDeep(data);
+      if (coords) {
+        lat = coords.lat;
+        lon = coords.lon;
+      }
+    }
+
+    // Strategy 3: Look for address in alternate locations
+    if (!address) {
+      address = findAddressDeep(data);
+    }
+
+    if (typeof lat !== "number" || typeof lon !== "number") {
+      console.warn("[GeoViz] Could not extract coordinates from GeoPhotoService response");
+      return null;
+    }
+
+    const countryFromAddress = inferCountryFromAddress(address) ?? null;
+    console.log("[GeoViz] Extracted metadata:", { lat, lon, country: countryFromAddress, address });
+
+    return {
+      lat,
+      lon,
+      country: countryFromAddress,
+      address: address || null,
+      country_code: countryFromAddress,
+      photoId,
+    };
   } catch (error) {
+    console.error("[GeoViz] extractMetadataFromArray error:", error);
     return null;
   }
+}
+
+// Deep search for coordinates in nested structure
+function findCoordinatesDeep(node) {
+  let lat = null;
+  let lon = null;
+
+  function scan(value) {
+    if (lat !== null && lon !== null) return;
+    if (Array.isArray(value)) {
+      // Look for arrays with coordinates pattern [something, something, lat, lon, ...]
+      if (value.length >= 4 && typeof value[2] === "number" && typeof value[3] === "number") {
+        const possibleLat = value[2];
+        const possibleLon = value[3];
+        // Validate as coordinates
+        if (possibleLat >= -90 && possibleLat <= 90 && possibleLon >= -180 && possibleLon <= 180) {
+          lat = possibleLat;
+          lon = possibleLon;
+          return;
+        }
+      }
+      for (const entry of value) {
+        scan(entry);
+        if (lat !== null && lon !== null) return;
+      }
+    } else if (typeof value === "object" && value !== null) {
+      for (const key of Object.keys(value)) {
+        scan(value[key]);
+        if (lat !== null && lon !== null) return;
+      }
+    }
+  }
+
+  scan(node);
+  if (lat === null || lon === null) return null;
+  return { lat, lon };
+}
+
+// Deep search for address strings
+function findAddressDeep(node) {
+  let bestAddress = null;
+
+  function scan(value) {
+    if (Array.isArray(value)) {
+      // Look for string arrays that might be addresses
+      if (value.length >= 2 && typeof value[0] === "string" && typeof value[1] === "string") {
+        const text = value[0].trim();
+        const lang = value[1].toLowerCase();
+        // Address-like strings contain commas and are reasonable length
+        if (text.includes(",") && text.length >= 5 && text.length <= 200) {
+          if (!bestAddress || text.length > bestAddress.length) {
+            bestAddress = text;
+          }
+        }
+      }
+      for (const entry of value) scan(entry);
+    } else if (typeof value === "object" && value !== null) {
+      for (const key of Object.keys(value)) scan(value[key]);
+    }
+  }
+
+  scan(node);
+  return bestAddress;
 }
 
 function inferCountryFromAddress(address) {
