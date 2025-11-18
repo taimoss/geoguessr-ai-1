@@ -141,10 +141,10 @@ const tabMetadataCache = new Map(); // tabId -> latest metadata for this tab
 const tabLastCoordTime = new Map(); // tabId -> timestamp of last coordinate received
 const utf8Decoder = new TextDecoder("utf-8");
 
-// Health check interval (check every 30 seconds)
-const HEALTH_CHECK_INTERVAL_MS = 30000;
+// Health check interval (check every 10 seconds)
+const HEALTH_CHECK_INTERVAL_MS = 10000;
 // If no coords for this long, consider connection stale
-const STALE_CONNECTION_MS = 60000;
+const STALE_CONNECTION_MS = 20000;
 
 function decodeBase64ToUtf8(body) {
   try {

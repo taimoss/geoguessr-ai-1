@@ -102,11 +102,15 @@ const MAX_CONSECUTIVE_DUPLICATES = 3;
 
 // Loading detection
 let lastStreetViewChangeTime = Date.now();
-const LOADING_TIMEOUT_MS = 30000; // 30 seconds without change = stuck
+const LOADING_TIMEOUT_MS = 5000; // 5 seconds without change = stuck
 
 // Coordinate watchdog - detect when debugger stops sending coords
 let lastCoordinateTime = Date.now();
-const COORD_TIMEOUT_MS = 45000; // 45 seconds without new coords = stale
+const COORD_TIMEOUT_MS = 15000; // 15 seconds without new coords = stale
+
+// Track consecutive null coordinates
+let consecutiveNullCoords = 0;
+const MAX_NULL_COORDS_BEFORE_RECONNECT = 2;
 
 // Simple hash function for image comparison
 function simpleImageHash(base64Data) {
@@ -1578,6 +1582,9 @@ async function scrapeRound() {
 
         // Send coordinates to backend FIRST so they're cached
         if (latestStreetViewMetadata?.lat != null && latestStreetViewMetadata?.lon != null) {
+          // Reset null counter on valid coords
+          consecutiveNullCoords = 0;
+
           try {
             console.log("[GeoViz] Sending coords to backend:", {
               lat: latestStreetViewMetadata.lat,
@@ -1609,7 +1616,19 @@ async function scrapeRound() {
             console.warn("[GeoViz] Failed to send coords:", coordError);
           }
         } else {
-          console.warn("[GeoViz] No coordinates available - continuing anyway");
+          consecutiveNullCoords++;
+          console.warn(`[GeoViz] No coordinates available (${consecutiveNullCoords}/${MAX_NULL_COORDS_BEFORE_RECONNECT})`);
+
+          // Force reconnection after too many null coords
+          if (consecutiveNullCoords >= MAX_NULL_COORDS_BEFORE_RECONNECT) {
+            console.warn("[GeoViz] Too many null coords - forcing debugger reconnection...");
+            updateStatus("Keine Koordinaten - verbinde Debugger neu...");
+            await requestDebuggerReconnect();
+            consecutiveNullCoords = 0;
+            // Wait for new coordinates
+            await sleep(2000, signal);
+            continue; // Skip this round and try again
+          }
         }
 
         // Capture and validate image before saving
@@ -1698,9 +1717,10 @@ function stopScrape(updateStatusText = true) {
   // Clear saved scrape state
   chrome.storage.local.remove(['geovizScrapeActive', 'geovizAutoRestart']).catch(() => {});
 
-  // Reset duplicate counter
+  // Reset counters
   consecutiveDuplicates = 0;
   lastImageHash = null;
+  consecutiveNullCoords = 0;
 
   const buttons = document.querySelectorAll("#geoviz-scrape");
   buttons.forEach((btn) => (btn.textContent = "Scrape"));
