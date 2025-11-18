@@ -95,6 +95,103 @@ let screenshotApiAvailable = true;
 // Unique tab identifier for multi-tab isolation
 const TAB_INSTANCE_ID = `tab-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
+// Image deduplication - prevent saving same/black images
+let lastImageHash = null;
+let consecutiveDuplicates = 0;
+const MAX_CONSECUTIVE_DUPLICATES = 3;
+
+// Loading detection
+let lastStreetViewChangeTime = Date.now();
+const LOADING_TIMEOUT_MS = 30000; // 30 seconds without change = stuck
+
+// Simple hash function for image comparison
+function simpleImageHash(base64Data) {
+  if (!base64Data || base64Data.length < 100) return null;
+
+  // Sample the image data at regular intervals for a quick hash
+  let hash = 0;
+  const step = Math.floor(base64Data.length / 100);
+  for (let i = 0; i < base64Data.length; i += step) {
+    hash = ((hash << 5) - hash) + base64Data.charCodeAt(i);
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash.toString(16);
+}
+
+// Check if image is mostly black or uniform (invalid)
+function isInvalidImage(base64Data) {
+  if (!base64Data || base64Data.length < 1000) return true;
+
+  // Decode a sample of the base64 to check for uniformity
+  try {
+    const binaryStr = atob(base64Data.substring(0, 10000));
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    // Check for mostly black (low byte values)
+    let lowCount = 0;
+    let totalChecked = 0;
+    for (let i = 0; i < bytes.length; i += 10) {
+      totalChecked++;
+      if (bytes[i] < 30) lowCount++;
+    }
+
+    // If more than 80% of sampled bytes are very low, image is likely black
+    if (totalChecked > 0 && (lowCount / totalChecked) > 0.8) {
+      console.log("[GeoViz] Black image detected - skipping");
+      return true;
+    }
+
+    // Check for uniformity (all similar values = loading screen or solid color)
+    const uniqueValues = new Set();
+    for (let i = 0; i < Math.min(bytes.length, 500); i += 5) {
+      uniqueValues.add(Math.floor(bytes[i] / 10)); // Group into ranges
+    }
+
+    if (uniqueValues.size < 5) {
+      console.log("[GeoViz] Uniform image detected (loading screen?) - skipping");
+      return true;
+    }
+
+    return false;
+  } catch (e) {
+    console.warn("[GeoViz] Error checking image validity:", e);
+    return false;
+  }
+}
+
+// Check if we should save this image (not duplicate, not black)
+function shouldSaveImage(base64Data) {
+  if (isInvalidImage(base64Data)) {
+    return false;
+  }
+
+  const hash = simpleImageHash(base64Data);
+  if (hash === lastImageHash) {
+    consecutiveDuplicates++;
+    console.log(`[GeoViz] Duplicate image detected (${consecutiveDuplicates}/${MAX_CONSECUTIVE_DUPLICATES})`);
+    return false;
+  }
+
+  // New unique image
+  lastImageHash = hash;
+  consecutiveDuplicates = 0;
+  return true;
+}
+
+// Check if page is stuck in loading
+function isPageStuck() {
+  const timeSinceChange = Date.now() - lastStreetViewChangeTime;
+  return timeSinceChange > LOADING_TIMEOUT_MS;
+}
+
+// Mark that street view has changed (call this when new image detected)
+function markStreetViewChanged() {
+  lastStreetViewChangeTime = Date.now();
+}
+
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, ms);
@@ -1407,6 +1504,12 @@ async function scrapeRound() {
   updateStatus("Scrape gestartet - laeuft endlos.");
   const buttons = document.querySelectorAll("#geoviz-scrape");
   buttons.forEach((btn) => (btn.textContent = "Stop Scrape"));
+  // Save scrape state for auto-restart after reload
+  chrome.storage.local.set({
+    geovizScrapeActive: true,
+    geovizTabInstanceId: TAB_INSTANCE_ID
+  }).catch(() => {});
+
   (async () => {
     while (scrapeActive && !signal.aborted) {
       try {
@@ -1414,9 +1517,39 @@ async function scrapeRound() {
         currentPrediction = null;
         updateResult(null);
 
+        // Check if page is stuck in loading
+        if (isPageStuck()) {
+          console.warn("[GeoViz] Page appears stuck - reloading...");
+          updateStatus("Seite hängt - lade neu...");
+          // Save state before reload
+          chrome.storage.local.set({
+            geovizScrapeActive: true,
+            geovizTabInstanceId: TAB_INSTANCE_ID,
+            geovizAutoRestart: true
+          }).catch(() => {});
+          await sleep(500, signal).catch(() => {});
+          window.location.reload();
+          return;
+        }
+
+        // Check for too many consecutive duplicates (also indicates stuck)
+        if (consecutiveDuplicates >= MAX_CONSECUTIVE_DUPLICATES) {
+          console.warn("[GeoViz] Too many duplicate images - page likely stuck, reloading...");
+          updateStatus("Zu viele Duplikate - lade neu...");
+          chrome.storage.local.set({
+            geovizScrapeActive: true,
+            geovizTabInstanceId: TAB_INSTANCE_ID,
+            geovizAutoRestart: true
+          }).catch(() => {});
+          await sleep(500, signal).catch(() => {});
+          window.location.reload();
+          return;
+        }
+
         // Wait for Street View to be ready
         try {
           await waitForStreetViewReady(signal, 10000);
+          markStreetViewChanged(); // Mark that we got a valid street view
         } catch (err) {
           console.warn("[GeoViz] Street View not ready, retrying...");
           await sleep(1000, signal).catch(() => {});
@@ -1464,11 +1597,28 @@ async function scrapeRound() {
           console.warn("[GeoViz] No coordinates available - continuing anyway");
         }
 
-        // Save screenshot - backend will use cached coords
+        // Capture and validate image before saving
+        let imageBase64;
         try {
-          await saveCurrentScreenshot({ silent: true });
+          imageBase64 = captureImageBase64();
         } catch (err) {
-          console.warn("[GeoViz] Screenshot failed:", err);
+          console.warn("[GeoViz] Failed to capture image:", err);
+          await sleep(500, signal).catch(() => {});
+          continue;
+        }
+
+        // Only save if image is valid and not a duplicate
+        if (shouldSaveImage(imageBase64)) {
+          try {
+            await saveCurrentScreenshot({ silent: true });
+            markStreetViewChanged(); // Valid new image = not stuck
+          } catch (err) {
+            console.warn("[GeoViz] Screenshot failed:", err);
+          }
+        } else {
+          console.log("[GeoViz] Skipping invalid/duplicate image");
+          // Don't immediately fail - wait and try again
+          await sleep(500, signal).catch(() => {});
         }
 
         // Quick marker placement at map center
@@ -1529,6 +1679,13 @@ function stopScrape(updateStatusText = true) {
 
   // Stop geo capture for this tab
   sendMessageAsync({ type: "STOP_GEO_CAPTURE" }).catch(() => {});
+
+  // Clear saved scrape state
+  chrome.storage.local.remove(['geovizScrapeActive', 'geovizAutoRestart']).catch(() => {});
+
+  // Reset duplicate counter
+  consecutiveDuplicates = 0;
+  lastImageHash = null;
 
   const buttons = document.querySelectorAll("#geoviz-scrape");
   buttons.forEach((btn) => (btn.textContent = "Scrape"));
@@ -1785,6 +1942,33 @@ async function init() {
   startNewGameMonitor();
   listenForDebuggerMetadata();
   await getConfig();
+
+  // Check for auto-restart after page reload
+  try {
+    const stored = await new Promise((resolve) => {
+      chrome.storage.local.get(['geovizScrapeActive', 'geovizAutoRestart'], resolve);
+    });
+
+    if (stored.geovizAutoRestart && stored.geovizScrapeActive) {
+      console.log("[GeoViz] Auto-restarting scrape after reload...");
+      updateStatus("Auto-Restart nach Reload...");
+
+      // Clear the auto-restart flag
+      await new Promise((resolve) => {
+        chrome.storage.local.remove(['geovizAutoRestart'], resolve);
+      });
+
+      // Wait for page to fully load
+      await sleep(3000);
+
+      // Auto-start scraping
+      if (!scrapeActive && !autoPlayActive) {
+        scrapeRound();
+      }
+    }
+  } catch (err) {
+    console.warn("[GeoViz] Error checking auto-restart:", err);
+  }
 }
 
 // Listen for GEO_METADATA from background.js (debugger captures)
