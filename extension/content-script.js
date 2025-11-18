@@ -170,6 +170,69 @@ function isInvalidImage(base64Data) {
   }
 }
 
+// Check if image is blurry/low quality (happens when tab not focused)
+function isBlurryImage(base64Data) {
+  if (!base64Data || base64Data.length < 5000) return true;
+
+  try {
+    const binaryStr = atob(base64Data.substring(0, 20000));
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    // Calculate variance - blurry images have low variance (similar adjacent pixels)
+    let diffSum = 0;
+    let diffCount = 0;
+    for (let i = 1; i < bytes.length; i += 3) {
+      const diff = Math.abs(bytes[i] - bytes[i - 1]);
+      diffSum += diff;
+      diffCount++;
+    }
+
+    const avgDiff = diffSum / diffCount;
+
+    // Low variance = blurry image
+    // High quality images typically have avgDiff > 15
+    if (avgDiff < 8) {
+      console.log(`[GeoViz] Blurry image detected (variance: ${avgDiff.toFixed(2)}) - will retry`);
+      return true;
+    }
+
+    return false;
+  } catch (e) {
+    console.warn("[GeoViz] Error checking image blur:", e);
+    return false;
+  }
+}
+
+// Force canvas to render at full quality
+async function ensureCanvasQuality(signal) {
+  const canvas = findStreetViewCanvas();
+  if (!canvas) return;
+
+  // Trigger focus events to force render
+  window.focus();
+  document.body.focus();
+
+  // Dispatch visibility change to trigger re-render
+  const visEvent = new Event('visibilitychange', { bubbles: true });
+  document.dispatchEvent(visEvent);
+
+  // Trigger resize to force re-render
+  window.dispatchEvent(new Event('resize'));
+
+  // Small wait for render
+  await sleep(300, signal).catch(() => {});
+
+  // Try to interact with canvas to trigger render
+  if (canvas.parentElement) {
+    canvas.parentElement.click();
+  }
+
+  await sleep(200, signal).catch(() => {});
+}
+
 // Check if we should save this image (not duplicate, not black)
 function shouldSaveImage(base64Data) {
   if (isInvalidImage(base64Data)) {
@@ -1631,18 +1694,44 @@ async function scrapeRound() {
           }
         }
 
+        // Ensure canvas is rendering at full quality before capture
+        await ensureCanvasQuality(signal);
+
         // Capture and validate image before saving
         let imageBase64;
-        try {
-          imageBase64 = captureImageBase64();
-        } catch (err) {
-          console.warn("[GeoViz] Failed to capture image:", err);
-          await sleep(500, signal).catch(() => {});
-          continue;
+        let captureAttempts = 0;
+        const maxCaptureAttempts = 3;
+
+        while (captureAttempts < maxCaptureAttempts) {
+          captureAttempts++;
+
+          try {
+            imageBase64 = captureImageBase64();
+          } catch (err) {
+            console.warn("[GeoViz] Failed to capture image:", err);
+            await sleep(500, signal).catch(() => {});
+            continue;
+          }
+
+          // Check if image is blurry (tab not focused)
+          if (isBlurryImage(imageBase64)) {
+            if (captureAttempts < maxCaptureAttempts) {
+              console.log(`[GeoViz] Retrying capture (attempt ${captureAttempts}/${maxCaptureAttempts})...`);
+              updateStatus(`Bild unscharf - Versuch ${captureAttempts}/${maxCaptureAttempts}...`);
+
+              // Force quality re-render
+              await ensureCanvasQuality(signal);
+              await sleep(500, signal).catch(() => {});
+              continue;
+            }
+          }
+
+          // Image is good quality, break out of retry loop
+          break;
         }
 
         // Only save if image is valid and not a duplicate
-        if (shouldSaveImage(imageBase64)) {
+        if (imageBase64 && shouldSaveImage(imageBase64) && !isBlurryImage(imageBase64)) {
           try {
             await saveCurrentScreenshot({ silent: true });
             markStreetViewChanged(); // Valid new image = not stuck
@@ -1650,7 +1739,7 @@ async function scrapeRound() {
             console.warn("[GeoViz] Screenshot failed:", err);
           }
         } else {
-          console.log("[GeoViz] Skipping invalid/duplicate image");
+          console.log("[GeoViz] Skipping invalid/duplicate/blurry image");
           // Don't immediately fail - wait and try again
           await sleep(500, signal).catch(() => {});
         }
