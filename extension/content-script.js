@@ -1307,21 +1307,17 @@ async function scrapeRound() {
         currentPrediction = null;
         updateResult(null);
 
-        // IMPORTANT: Reset metadata for fresh capture
-        latestStreetViewMetadata = null;
-        lastProcessedPhotoId = null;
-
         // Wait for Street View to be ready
-        await waitForStreetViewReady(signal, 6000);
-
-        // Wait for GeoPhotoService to capture NEW coordinates
-        await sleep(800, signal);
-
-        // Check if we got new coordinates
-        if (!latestStreetViewMetadata || latestStreetViewMetadata.lat == null) {
-          console.warn("[GeoViz] No new coordinates captured, waiting longer...");
-          await sleep(500, signal);
+        try {
+          await waitForStreetViewReady(signal, 10000);
+        } catch (err) {
+          console.warn("[GeoViz] Street View not ready, retrying...");
+          await sleep(1000, signal).catch(() => {});
+          continue;
         }
+
+        // Wait for debugger to capture coordinates
+        await sleep(1500, signal);
 
         const roundId = `round-${currentRound}`;
 
@@ -1358,29 +1354,47 @@ async function scrapeRound() {
             console.warn("[GeoViz] Failed to send coords:", coordError);
           }
         } else {
-          console.warn("[GeoViz] No coordinates available from GeoPhotoService");
+          console.warn("[GeoViz] No coordinates available - continuing anyway");
         }
 
         // Save screenshot - backend will use cached coords
-        await saveCurrentScreenshot({ silent: true });
+        try {
+          await saveCurrentScreenshot({ silent: true });
+        } catch (err) {
+          console.warn("[GeoViz] Screenshot failed:", err);
+        }
 
         // Quick marker placement at map center
-        await placeMarkerAtMapCenter(signal);
+        try {
+          await placeMarkerAtMapCenter(signal);
+        } catch (err) {
+          console.warn("[GeoViz] Marker placement failed:", err);
+        }
 
         // Submit guess quickly
-        await submitGuess(signal);
+        try {
+          await submitGuess(signal);
+        } catch (err) {
+          console.warn("[GeoViz] Submit guess failed:", err);
+          await sleep(500, signal).catch(() => {});
+          continue;
+        }
 
         // Wait for result
         await waitForRoundResult(signal, currentRound - 1);
 
-        // Transition to next round/game
-        try {
-          await handleResultTransition(currentRound >= ROUND_LIMIT, signal);
-        } catch (error) {
-          console.warn("[GeoViz] Scrape transition failed", error);
+        // Increment round counter
+        currentRound += 1;
+        if (currentRound > ROUND_LIMIT) {
+          currentRound = 1;
         }
+        updateRoundInput();
 
-        updateStatus(`Scrape: Runde ${currentRound} abgeschlossen.`);
+        updateStatus(`Scrape: Runde ${currentRound - 1} abgeschlossen.`);
+
+        // Small delay before next round
+        await sleep(500, signal).catch(() => {});
+
       } catch (error) {
         if (signal.aborted) break;
         console.warn("[GeoViz] Scrape failed", error);
@@ -1390,7 +1404,7 @@ async function scrapeRound() {
           return;
         }
         updateStatus(`${STATUS_ERROR}${message}`);
-        await sleep(200, signal).catch(() => {});
+        await sleep(1000, signal).catch(() => {});
       }
     }
     stopScrape(false);
@@ -1634,7 +1648,45 @@ async function init() {
   monitorResultPanels();
   interceptGeoPhotoService();
   startNewGameMonitor();
+  listenForDebuggerMetadata();
   await getConfig();
+}
+
+// Listen for GEO_METADATA from background.js (debugger captures)
+function listenForDebuggerMetadata() {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "GEO_METADATA" && message?.payload) {
+      const payload = message.payload;
+      const latValue = Number(payload?.lat);
+      const lonValue = Number(payload?.lon);
+
+      if (Number.isFinite(latValue) && Number.isFinite(lonValue)) {
+        console.log("[GeoViz] Received debugger metadata:", latValue, lonValue, payload?.place);
+
+        // Update latestStreetViewMetadata
+        latestStreetViewMetadata = {
+          lat: latValue,
+          lon: lonValue,
+          address: payload?.place || null,
+          country: null,
+          country_code: null,
+          photoId: null,
+        };
+
+        // Try to infer country from place/address
+        if (payload?.place) {
+          const inferredCountry = inferCountryFromAddress(payload.place);
+          if (inferredCountry) {
+            latestStreetViewMetadata.country = inferredCountry;
+            latestStreetViewMetadata.country_code = inferredCountry;
+          }
+        }
+
+        console.log("[GeoViz] Updated latestStreetViewMetadata:", latestStreetViewMetadata);
+      }
+    }
+    return false; // Don't send response
+  });
 }
 
 if (window.top === window) {
