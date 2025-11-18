@@ -2047,7 +2047,23 @@ function listenForDebuggerMetadata() {
     if (message?.type === "DEBUGGER_RECONNECTED") {
       console.log("[GeoViz] Debugger was reconnected by background health check");
       lastCoordinateTime = Date.now(); // Reset watchdog
-      updateStatus("Debugger neu verbunden");
+      consecutiveNullCoords = 0; // Reset null counter
+      updateStatus("Debugger neu verbunden - starte Scraper neu...");
+
+      // If scrape should be active but loop stopped, restart it
+      if (scrapeActive && !scrapeAbortController) {
+        console.log("[GeoViz] Restarting scrape loop after debugger reconnection...");
+        scrapeActive = false; // Reset so scrapeRound() can start fresh
+        setTimeout(() => scrapeRound(), 500);
+      } else if (!scrapeActive && !autoPlayActive) {
+        // Check storage if scrape was supposed to be active
+        chrome.storage.local.get(['geovizScrapeActive'], (stored) => {
+          if (stored.geovizScrapeActive) {
+            console.log("[GeoViz] Restarting scrape from storage flag after reconnection...");
+            setTimeout(() => scrapeRound(), 500);
+          }
+        });
+      }
     }
 
     return false; // Don't send response
