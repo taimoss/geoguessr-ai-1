@@ -80,26 +80,45 @@ def normalize_country_label(label: Optional[str]) -> Optional[str]:
 def extract_country_hint(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
     if not isinstance(metadata, dict):
         return None
+
+    # Priority 1: Use coordinates from street_view (most reliable)
     street_view = metadata.get("street_view")
     if isinstance(street_view, dict):
+        lat = street_view.get("lat")
+        lon = street_view.get("lon")
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            country_code = country_from_coords(lat, lon)
+            if country_code:
+                return country_code
+        # Fallback to country name if coords failed
         country = street_view.get("country")
         code = normalize_country_label(country)
         if code:
             return code
-        lat = street_view.get("lat")
-        lon = street_view.get("lon")
-        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-            return country_from_coords(lat, lon)
+
+    # Priority 2: Use coordinates from result_map
     result_map = metadata.get("result_from_map")
     if isinstance(result_map, dict):
+        lat = result_map.get("lat")
+        lon = result_map.get("lon")
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            country_code = country_from_coords(lat, lon)
+            if country_code:
+                return country_code
+        # Fallback to country name
         country = result_map.get("country")
         code = normalize_country_label(country)
         if code:
             return code
-        lat = result_map.get("lat")
-        lon = result_map.get("lon")
-        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-            return country_from_coords(lat, lon)
+
+    # Priority 3: Check for direct lat/lon in metadata
+    lat = metadata.get("lat")
+    lon = metadata.get("lon")
+    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+        country_code = country_from_coords(lat, lon)
+        if country_code:
+            return country_code
+
     return None
 
 
