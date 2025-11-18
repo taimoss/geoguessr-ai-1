@@ -132,10 +132,13 @@ async function saveScreenshot(payload) {
 
 const GEO_CAPTURE_VERSION = "1.3";
 const GEO_SERVICE_REGEX = /GeoPhotoService/i;
-let geoCaptureTabId = null;
-const geoRequestUrlById = new Map();
+
+// Multi-tab support: track multiple tabs simultaneously
+const activeCaptureTabs = new Set(); // Set of tab IDs with active capture
+const geoRequestUrlById = new Map(); // requestId -> url
+const tabCoordinateSignatures = new Map(); // tabId -> last signature (prevents duplicates per tab)
+const tabMetadataCache = new Map(); // tabId -> latest metadata for this tab
 const utf8Decoder = new TextDecoder("utf-8");
-let lastCoordinateSignature = null;
 
 function decodeBase64ToUtf8(body) {
   try {
@@ -262,40 +265,50 @@ function persistGeoMetadata(payload) {
 
 async function emitGeoMetadata(tabId, metadata) {
   const signature = `${metadata.lat?.toFixed?.(5)}:${metadata.lon?.toFixed?.(5)}`;
-  if (signature && signature === lastCoordinateSignature) {
+
+  // Check per-tab signature to prevent duplicates within same tab
+  const lastSig = tabCoordinateSignatures.get(tabId);
+  if (signature && signature === lastSig) {
     return;
   }
-  lastCoordinateSignature = signature;
+  tabCoordinateSignatures.set(tabId, signature);
+
+  // Cache metadata for this specific tab
+  tabMetadataCache.set(tabId, {
+    ...metadata,
+    tabId,
+    capturedAt: Date.now(),
+  });
+
   persistGeoMetadata(metadata);
   sendGeoMetadataToTab(tabId, metadata);
-  try {
-    await sendCoords({
-      lat: metadata.lat,
-      lon: metadata.lon,
-      source: metadata.source ?? "debugger",
-      captured_at: new Date(metadata.timestamp || Date.now()).toISOString(),
-      metadata: {
-        place: metadata.place ?? null,
-        language: metadata.language ?? null,
-        url: metadata.url ?? null,
-      },
-    });
-  } catch (error) {
-    console.warn("[GeoViz] SEND_COORDS failed:", error);
-  }
+
+  // Note: We don't send coords here anymore - the content script will send them
+  // with proper session_id and round_id context
+  console.log(`[GeoViz] Tab ${tabId}: Coordinates captured ${metadata.lat?.toFixed(5)}, ${metadata.lon?.toFixed(5)}`);
 }
 
 async function startGeoCapture(tabId) {
   if (!tabId) {
     throw new Error("Kein Tab für GeoCapture verfügbar.");
   }
-  if (geoCaptureTabId === tabId) return;
-  if (geoCaptureTabId !== null && geoCaptureTabId !== tabId) {
-    await stopGeoCapture();
+
+  // Already capturing this tab
+  if (activeCaptureTabs.has(tabId)) {
+    console.log(`[GeoViz] Tab ${tabId} already has active capture`);
+    return;
   }
+
   return new Promise((resolve, reject) => {
     chrome.debugger.attach({ tabId }, GEO_CAPTURE_VERSION, () => {
       if (chrome.runtime.lastError) {
+        // If already attached, that's ok
+        if (chrome.runtime.lastError.message.includes("Another debugger")) {
+          console.log(`[GeoViz] Tab ${tabId} debugger already attached`);
+          activeCaptureTabs.add(tabId);
+          resolve();
+          return;
+        }
         reject(new Error(chrome.runtime.lastError.message));
         return;
       }
@@ -304,41 +317,63 @@ async function startGeoCapture(tabId) {
           reject(new Error(chrome.runtime.lastError.message));
           return;
         }
-        geoCaptureTabId = tabId;
-        geoRequestUrlById.clear();
+        activeCaptureTabs.add(tabId);
+        tabCoordinateSignatures.delete(tabId); // Reset signature for fresh capture
+        console.log(`[GeoViz] Geo capture started for tab ${tabId}. Active tabs: ${activeCaptureTabs.size}`);
         resolve();
       });
     });
   });
 }
 
-function stopGeoCapture() {
+function stopGeoCapture(tabId = null) {
   return new Promise((resolve) => {
-    if (geoCaptureTabId === null) {
+    // If no specific tab, resolve (don't stop all)
+    if (tabId === null) {
       resolve();
       return;
     }
-    const targetTab = geoCaptureTabId;
-    chrome.debugger.detach({ tabId: targetTab }, () => {
-      geoCaptureTabId = null;
-      geoRequestUrlById.clear();
-      lastCoordinateSignature = null;
+
+    if (!activeCaptureTabs.has(tabId)) {
+      resolve();
+      return;
+    }
+
+    chrome.debugger.detach({ tabId }, () => {
+      activeCaptureTabs.delete(tabId);
+      tabCoordinateSignatures.delete(tabId);
+      tabMetadataCache.delete(tabId);
+      console.log(`[GeoViz] Geo capture stopped for tab ${tabId}. Active tabs: ${activeCaptureTabs.size}`);
       resolve();
     });
   });
 }
 
+// Stop all captures (for cleanup)
+function stopAllGeoCaptures() {
+  const promises = [];
+  for (const tabId of activeCaptureTabs) {
+    promises.push(stopGeoCapture(tabId));
+  }
+  return Promise.all(promises);
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (source.tabId !== geoCaptureTabId) return;
+  // Multi-tab: check if this tab is being captured
+  if (!activeCaptureTabs.has(source.tabId)) return;
   if (method !== "Network.responseReceived") return;
   const url = params?.response?.url || "";
   if (!GEO_SERVICE_REGEX.test(url)) return;
-  geoRequestUrlById.set(params.requestId, url);
+
+  const requestKey = `${source.tabId}-${params.requestId}`;
+  geoRequestUrlById.set(requestKey, url);
+
   chrome.debugger.sendCommand(
     { tabId: source.tabId },
     "Network.getResponseBody",
     { requestId: params.requestId },
     (body) => {
+      geoRequestUrlById.delete(requestKey);
       if (chrome.runtime.lastError || !body) {
         return;
       }
@@ -357,14 +392,15 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         url,
         timestamp: Date.now(),
         hookType: "debugger",
+        tabId: source.tabId,
       });
     }
   );
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === geoCaptureTabId) {
-    stopGeoCapture();
+  if (activeCaptureTabs.has(tabId)) {
+    stopGeoCapture(tabId);
   }
 });
 
@@ -430,7 +466,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "STOP_GEO_CAPTURE") {
-    stopGeoCapture()
+    const tabId = sender?.tab?.id;
+    stopGeoCapture(tabId)
       .then(() => sendResponse({ success: true }))
       .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;

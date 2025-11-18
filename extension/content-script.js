@@ -92,6 +92,9 @@ let lastProcessedPhotoId = null;
 const roundMetadata = new Map();
 let screenshotApiAvailable = true;
 
+// Unique tab identifier for multi-tab isolation
+const TAB_INSTANCE_ID = `tab-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, ms);
@@ -800,7 +803,8 @@ async function getConfig() {
   if (!response?.success) throw new Error(response?.error || "Konnte Config nicht laden.");
   extensionConfig = response.config;
   if (!currentSessionId) {
-    currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+    // Include TAB_INSTANCE_ID for multi-tab isolation
+    currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
     const sessionInput = document.getElementById("geoviz-session");
     if (sessionInput) sessionInput.value = currentSessionId;
   }
@@ -879,7 +883,8 @@ async function ensureSessionDefaults() {
   if (!extensionConfig.sessionPrefix) {
     extensionConfig.sessionPrefix = "chrome-session";
   }
-  currentSessionId = `${extensionConfig.sessionPrefix}-${Date.now()}`;
+  // Include TAB_INSTANCE_ID for multi-tab isolation
+  currentSessionId = `${extensionConfig.sessionPrefix}-${TAB_INSTANCE_ID}-${Date.now()}`;
   const sessionInput = document.getElementById("geoviz-session");
   if (sessionInput) sessionInput.value = currentSessionId;
 }
@@ -1273,7 +1278,8 @@ async function startNextGame(signal) {
   currentRound = 1;
   updateRoundInput();
   lastGuessCoordinates = null;
-  currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+  // Include TAB_INSTANCE_ID for multi-tab isolation
+  currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
   const sessionInput = document.getElementById("geoviz-session");
   if (sessionInput) sessionInput.value = currentSessionId;
 }
@@ -1284,6 +1290,95 @@ async function waitForStreetViewReady(signal, timeout = 15000) {
 
 let scrapeActive = false;
 let scrapeAbortController = null;
+
+// Keep-alive mechanism to prevent tab throttling and black images
+let keepAliveAudioContext = null;
+let keepAliveInterval = null;
+let wakeLock = null;
+
+async function startKeepAlive() {
+  if (keepAliveInterval) return;
+
+  // Method 1: Silent audio context keeps tab active
+  try {
+    keepAliveAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = keepAliveAudioContext.createOscillator();
+    const gainNode = keepAliveAudioContext.createGain();
+    gainNode.gain.value = 0.001; // Nearly silent
+    oscillator.connect(gainNode);
+    gainNode.connect(keepAliveAudioContext.destination);
+    oscillator.start();
+    console.log("[GeoViz] Keep-alive audio context started");
+  } catch (err) {
+    console.warn("[GeoViz] Could not create audio context:", err);
+  }
+
+  // Method 2: Screen Wake Lock API (if available)
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      console.log("[GeoViz] Screen wake lock acquired");
+      wakeLock.addEventListener('release', () => {
+        console.log("[GeoViz] Wake lock released, attempting to reacquire...");
+        if (scrapeActive || autoPlayActive) {
+          navigator.wakeLock.request('screen').then(lock => {
+            wakeLock = lock;
+          }).catch(() => {});
+        }
+      });
+    }
+  } catch (err) {
+    console.warn("[GeoViz] Could not acquire wake lock:", err);
+  }
+
+  // Method 3: Periodic activity to prevent throttling
+  keepAliveInterval = setInterval(() => {
+    if (!scrapeActive && !autoPlayActive) {
+      stopKeepAlive();
+      return;
+    }
+
+    // Force browser to consider tab active
+    if (keepAliveAudioContext?.state === 'suspended') {
+      keepAliveAudioContext.resume().catch(() => {});
+    }
+
+    // Trigger minimal DOM read to keep tab responsive
+    const _ = document.hidden;
+  }, 5000);
+
+  // Handle visibility changes
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+}
+
+function handleVisibilityChange() {
+  if (document.hidden && (scrapeActive || autoPlayActive)) {
+    console.log("[GeoViz] Tab hidden but scrape active - maintaining keep-alive");
+    if (keepAliveAudioContext?.state === 'suspended') {
+      keepAliveAudioContext.resume().catch(() => {});
+    }
+  }
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+
+  if (keepAliveAudioContext) {
+    keepAliveAudioContext.close().catch(() => {});
+    keepAliveAudioContext = null;
+  }
+
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
+  console.log("[GeoViz] Keep-alive stopped");
+}
 
 async function scrapeRound() {
   if (autoPlayActive) {
@@ -1297,6 +1392,18 @@ async function scrapeRound() {
   scrapeActive = true;
   scrapeAbortController = new AbortController();
   const { signal } = scrapeAbortController;
+
+  // Start keep-alive to prevent black images
+  await startKeepAlive();
+
+  // Start geo capture debugger for this tab
+  try {
+    await sendMessageAsync({ type: "START_GEO_CAPTURE" });
+    console.log("[GeoViz] Geo capture started for this tab");
+  } catch (err) {
+    console.warn("[GeoViz] Could not start geo capture:", err);
+  }
+
   updateStatus("Scrape gestartet - laeuft endlos.");
   const buttons = document.querySelectorAll("#geoviz-scrape");
   buttons.forEach((btn) => (btn.textContent = "Stop Scrape"));
@@ -1416,6 +1523,13 @@ function stopScrape(updateStatusText = true) {
   scrapeActive = false;
   scrapeAbortController?.abort();
   scrapeAbortController = null;
+
+  // Stop keep-alive
+  stopKeepAlive();
+
+  // Stop geo capture for this tab
+  sendMessageAsync({ type: "STOP_GEO_CAPTURE" }).catch(() => {});
+
   const buttons = document.querySelectorAll("#geoviz-scrape");
   buttons.forEach((btn) => (btn.textContent = "Scrape"));
   if (updateStatusText) {
@@ -1501,11 +1615,23 @@ async function autoPlayLoop(signal) {
   }
 }
 
-function startAutoPlay() {
+async function startAutoPlay() {
   if (autoPlayActive) return;
   autoPlayActive = true;
   updateAutoButton();
   updateStatus("Auto Play aktiviert – Spiel startet automatisch.");
+
+  // Start keep-alive to prevent black images
+  await startKeepAlive();
+
+  // Start geo capture debugger for this tab
+  try {
+    await sendMessageAsync({ type: "START_GEO_CAPTURE" });
+    console.log("[GeoViz] Geo capture started for auto play");
+  } catch (err) {
+    console.warn("[GeoViz] Could not start geo capture:", err);
+  }
+
   autoPlayAbortController = new AbortController();
   autoPlayLoop(autoPlayAbortController.signal);
   sendMessageAsync({
@@ -1521,6 +1647,13 @@ function stopAutoPlay(persist = true) {
   updateStatus("Auto Play gestoppt.");
   autoPlayAbortController?.abort();
   autoPlayAbortController = null;
+
+  // Stop keep-alive
+  stopKeepAlive();
+
+  // Stop geo capture for this tab
+  sendMessageAsync({ type: "STOP_GEO_CAPTURE" }).catch(() => {});
+
   if (persist) {
     sendMessageAsync({
       type: "SAVE_CONFIG",
@@ -1593,7 +1726,8 @@ function startNewGameMonitor() {
         updateRoundInput();
         lastGuessCoordinates = null;
         latestStreetViewMetadata = null;
-        currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+        // Include TAB_INSTANCE_ID for multi-tab isolation
+        currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
         const sessionInput = document.getElementById("geoviz-session");
         if (sessionInput) sessionInput.value = currentSessionId;
         return;
@@ -1610,7 +1744,8 @@ function startNewGameMonitor() {
       updateRoundInput();
       lastGuessCoordinates = null;
       latestStreetViewMetadata = null;
-      currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
+      // Include TAB_INSTANCE_ID for multi-tab isolation
+      currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${TAB_INSTANCE_ID}-${Date.now()}`;
       const sessionInput = document.getElementById("geoviz-session");
       if (sessionInput) sessionInput.value = currentSessionId;
       return;
