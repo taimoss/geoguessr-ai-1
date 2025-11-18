@@ -885,12 +885,12 @@ async function ensureSessionDefaults() {
 }
 
 async function ensureGuessMapOpen(signal) {
-  const toggleButton = await waitForElement(SELECTORS.mapToggle, { timeout: 5000, signal }).catch(
+  const toggleButton = await waitForElement(SELECTORS.mapToggle, { timeout: 2000, signal }).catch(
     () => null
   );
   if (toggleButton) {
     toggleButton.click();
-    await sleep(500, signal);
+    await sleep(100, signal);
   }
 }
 
@@ -922,12 +922,12 @@ function setNativeValue(element, value) {
 
 async function placeGuessOnMap(lat, lon, signal) {
   await ensureGuessMapOpen(signal);
-  await sleep(150, signal).catch(() => {});
+  await sleep(50, signal).catch(() => {});
   const reactHandler = findReactGuessHandler();
   if (reactHandler) {
     try {
       reactHandler({ lat, lng: lon });
-      await sleep(300, signal).catch(() => {});
+      await sleep(50, signal).catch(() => {});
       const marker = readGuessMarkerFromMap();
       if (marker) {
         lastGuessCoordinates = marker;
@@ -951,20 +951,20 @@ async function placeGuessOnMap(lat, lon, signal) {
   if (!placementSucceeded) {
     await placeMarkerViaClick(lat, lon, signal);
   }
-  await sleep(400, signal).catch(() => {});
+  await sleep(50, signal).catch(() => {});
   let currentMarker = readGuessMarkerFromMap();
   lastGuessCoordinates = currentMarker ?? { lat, lon };
 }
 
 async function placeMarkerAtMapCenter(signal) {
   await ensureGuessMapOpen(signal);
-  await sleep(100, signal).catch(() => {});
+  await sleep(30, signal).catch(() => {});
   const surface = await getGuessMapSurface(signal);
   const rect = surface.getBoundingClientRect();
   const clientX = rect.left + rect.width / 2;
   const clientY = rect.top + rect.height / 2;
   simulateCanvasClick(surface, clientX, clientY);
-  await sleep(200, signal).catch(() => {});
+  await sleep(50, signal).catch(() => {});
   const marker = readGuessMarkerFromMap();
   lastGuessCoordinates = marker ?? null;
 }
@@ -972,7 +972,7 @@ async function placeMarkerAtMapCenter(signal) {
 async function submitGuess(signal) {
   const button = await waitForGuessButtonEnabled(signal);
   button.click();
-  await sleep(500, signal);
+  await sleep(100, signal);
 }
 
 async function waitForRoundResult(signal, roundIndex = currentRound - 1) {
@@ -984,13 +984,13 @@ async function waitForRoundResult(signal, roundIndex = currentRound - 1) {
 
 async function handleResultTransition(isFinalRound, signal) {
   await clickViewResultsButton(signal);
-  await sleep(500, signal);
+  await sleep(150, signal);
   if (!isFinalRound) {
     const advanced = await goToNextRound(signal);
     if (advanced) {
       currentRound += 1;
       updateRoundInput();
-      await sleep(400, signal);
+      await sleep(100, signal);
       return;
     }
   }
@@ -1006,7 +1006,7 @@ async function placeMarkerViaSearch(lat, lon, signal, inputOverride) {
     searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     searchInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
     const markerBefore = readGuessMarkerFromMap();
-    await sleep(1200, signal);
+    await sleep(150, signal);
     const markerAfter = readGuessMarkerFromMap();
     if (
       markerAfter &&
@@ -1027,7 +1027,7 @@ async function placeMarkerViaClick(lat, lon, signal) {
   const rect = surface.getBoundingClientRect();
   const { x, y } = projectLatLonToCanvas(lat, lon, rect);
   simulateCanvasClick(surface, x, y);
-  await sleep(800, signal);
+  await sleep(100, signal);
 }
 
 async function getGuessMapSurface(signal) {
@@ -1235,7 +1235,7 @@ async function goToNextRound(signal) {
   const explicitButton = queryButtonByText(BUTTON_TEXT.next);
   if (explicitButton) {
     explicitButton.click();
-    await sleep(600, signal);
+    await sleep(150, signal);
     return true;
   }
   const fallbackSelectors = [
@@ -1246,7 +1246,7 @@ async function goToNextRound(signal) {
     const btn = document.querySelector(selector);
     if (btn) {
       btn.click();
-      await sleep(600, signal);
+      await sleep(150, signal);
       return true;
     }
   }
@@ -1256,14 +1256,14 @@ async function goToNextRound(signal) {
 async function startNextGame(signal) {
   let nextRoundReady = false;
   for (let attempt = 0; attempt < 3 && !nextRoundReady && !signal?.aborted; attempt += 1) {
-    const playAgainButton = await waitForPlayAgainButton(signal, 15000);
+    const playAgainButton = await waitForPlayAgainButton(signal, 8000);
     if (!playAgainButton) {
-      await sleep(600, signal).catch(() => {});
+      await sleep(200, signal).catch(() => {});
       continue;
     }
     playAgainButton.click();
-    await sleep(1500, signal).catch(() => {});
-    nextRoundReady = await waitForStreetViewReady(signal, 12000)
+    await sleep(300, signal).catch(() => {});
+    nextRoundReady = await waitForStreetViewReady(signal, 8000)
       .then(() => true)
       .catch(() => false);
   }
@@ -1306,17 +1306,58 @@ async function scrapeRound() {
         lastInferencePayload = null;
         currentPrediction = null;
         updateResult(null);
-        await waitForStreetViewReady(signal, 9000);
+
+        // Wait for Street View to be ready
+        await waitForStreetViewReady(signal, 6000);
+
+        // Wait a short moment for GeoPhotoService to capture coordinates
+        await sleep(200, signal);
+
+        // Send coordinates to backend if available
+        if (latestStreetViewMetadata?.lat != null && latestStreetViewMetadata?.lon != null) {
+          try {
+            await sendMessageAsync({
+              type: "SEND_COORDS",
+              payload: {
+                lat: latestStreetViewMetadata.lat,
+                lon: latestStreetViewMetadata.lon,
+                source: "scrape",
+                captured_at: new Date().toISOString(),
+                session_id: currentSessionId,
+                round_id: `round-${currentRound}`,
+                round_index: currentRound,
+                metadata: {
+                  country: latestStreetViewMetadata.country,
+                  address: latestStreetViewMetadata.address,
+                  photoId: latestStreetViewMetadata.photoId,
+                },
+              },
+            });
+          } catch (coordError) {
+            console.warn("[GeoViz] Failed to send coords:", coordError);
+          }
+        }
+
+        // Save screenshot with coordinates metadata
         await saveCurrentScreenshot({ silent: true });
+
+        // Quick marker placement at map center
         await placeMarkerAtMapCenter(signal);
+
+        // Submit guess quickly
         await submitGuess(signal);
+
+        // Wait for result
         await waitForRoundResult(signal, currentRound - 1);
+
+        // Transition to next round/game
         try {
           await handleResultTransition(currentRound >= ROUND_LIMIT, signal);
         } catch (error) {
           console.warn("[GeoViz] Scrape transition failed", error);
         }
-        updateStatus("Scrape: naechstes Bild.");
+
+        updateStatus(`Scrape: Runde ${currentRound} abgeschlossen.`);
       } catch (error) {
         if (signal.aborted) break;
         console.warn("[GeoViz] Scrape failed", error);
@@ -1326,7 +1367,7 @@ async function scrapeRound() {
           return;
         }
         updateStatus(`${STATUS_ERROR}${message}`);
-        await sleep(400, signal).catch(() => {});
+        await sleep(200, signal).catch(() => {});
       }
     }
     stopScrape(false);
@@ -1355,6 +1396,35 @@ async function playAutomaticMatch(signal) {
     lastGuessCoordinates = null;
     updateStatus(`Auto Play: Runde ${roundIndex + 1} von ${ROUND_LIMIT}…`);
     await waitForStreetViewReady(signal);
+
+    // Short wait for GeoPhotoService to capture coordinates
+    await sleep(100, signal);
+
+    // Send coordinates to backend if available
+    if (latestStreetViewMetadata?.lat != null && latestStreetViewMetadata?.lon != null) {
+      try {
+        await sendMessageAsync({
+          type: "SEND_COORDS",
+          payload: {
+            lat: latestStreetViewMetadata.lat,
+            lon: latestStreetViewMetadata.lon,
+            source: "auto_play",
+            captured_at: new Date().toISOString(),
+            session_id: currentSessionId,
+            round_id: `round-${roundIndex + 1}`,
+            round_index: roundIndex + 1,
+            metadata: {
+              country: latestStreetViewMetadata.country,
+              address: latestStreetViewMetadata.address,
+              photoId: latestStreetViewMetadata.photoId,
+            },
+          },
+        });
+      } catch (coordError) {
+        console.warn("[GeoViz] Failed to send coords:", coordError);
+      }
+    }
+
     try {
       const prediction = await requestPrediction({ silent: true });
       currentPrediction = prediction;
@@ -1364,9 +1434,9 @@ async function playAutomaticMatch(signal) {
       await submitGuess(signal);
       await waitForRoundResult(signal, roundIndex);
       if (lastInferencePayload) {
-      await logRoundResult(roundIndex, lastInferencePayload);
-    }
-    await sleep(400, signal);
+        await logRoundResult(roundIndex, lastInferencePayload);
+      }
+      await sleep(100, signal);
     } catch (error) {
       console.warn("[GeoViz] Auto play round failed:", error);
       updateStatus(`${STATUS_ERROR}${error.message}`);
@@ -1376,7 +1446,7 @@ async function playAutomaticMatch(signal) {
       await handleResultTransition(roundIndex >= ROUND_LIMIT - 1, signal);
     } catch (error) {
       console.warn("[GeoViz] handleResultTransition failed:", error);
-      await sleep(800, signal);
+      await sleep(200, signal);
     }
   }
 }
@@ -1456,6 +1526,34 @@ function monitorResultPanels() {
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
+// Continuous monitor for "New Game" button to enable endless loop
+let newGameMonitorInterval = null;
+
+function startNewGameMonitor() {
+  if (newGameMonitorInterval) return;
+
+  newGameMonitorInterval = setInterval(() => {
+    // Only act if auto-play or scrape is active
+    if (!autoPlayActive && !scrapeActive) return;
+
+    const playAgainButton = findPlayAgainButton();
+    if (playAgainButton) {
+      // Check if we're at the end of a game (round 5 completed)
+      if (currentRound >= ROUND_LIMIT) {
+        console.log("[GeoViz] New Game button detected, starting new game...");
+        playAgainButton.click();
+      }
+    }
+  }, 500);
+}
+
+function stopNewGameMonitor() {
+  if (newGameMonitorInterval) {
+    clearInterval(newGameMonitorInterval);
+    newGameMonitorInterval = null;
+  }
+}
+
 async function init() {
   createOverlay();
   updateResult(null);
@@ -1463,6 +1561,7 @@ async function init() {
   monitorCanvasChanges();
   monitorResultPanels();
   interceptGeoPhotoService();
+  startNewGameMonitor();
   await getConfig();
 }
 
@@ -1563,6 +1662,91 @@ function extractMetadataFromArray(data) {
 
 function inferCountryFromAddress(address) {
   if (!address) return null;
-  const parts = address.split(",").map((part) => part.trim());
-  return parts.length ? parts[parts.length - 1] : null;
+  const parts = address.split(",").map((part) => part.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  // Country is typically the last part of the address
+  const lastPart = parts[parts.length - 1];
+
+  // Common country name mappings to ISO codes
+  const countryMappings = {
+    'united states': 'US', 'usa': 'US', 'u.s.a.': 'US', 'u.s.': 'US', 'america': 'US',
+    'united kingdom': 'GB', 'uk': 'GB', 'great britain': 'GB', 'england': 'GB', 'scotland': 'GB', 'wales': 'GB',
+    'germany': 'DE', 'deutschland': 'DE',
+    'france': 'FR', 'francia': 'FR', 'frankreich': 'FR',
+    'spain': 'ES', 'españa': 'ES', 'espana': 'ES', 'spanien': 'ES',
+    'italy': 'IT', 'italia': 'IT', 'italien': 'IT',
+    'netherlands': 'NL', 'nederland': 'NL', 'holland': 'NL',
+    'belgium': 'BE', 'belgique': 'BE', 'belgie': 'BE', 'belgien': 'BE',
+    'portugal': 'PT',
+    'austria': 'AT', 'österreich': 'AT', 'osterreich': 'AT',
+    'switzerland': 'CH', 'schweiz': 'CH', 'suisse': 'CH', 'svizzera': 'CH',
+    'poland': 'PL', 'polska': 'PL', 'polen': 'PL',
+    'czech republic': 'CZ', 'czechia': 'CZ', 'česko': 'CZ', 'cesko': 'CZ',
+    'sweden': 'SE', 'sverige': 'SE', 'schweden': 'SE',
+    'norway': 'NO', 'norge': 'NO', 'norwegen': 'NO',
+    'denmark': 'DK', 'danmark': 'DK', 'dänemark': 'DK', 'danemark': 'DK',
+    'finland': 'FI', 'suomi': 'FI', 'finnland': 'FI',
+    'russia': 'RU', 'россия': 'RU', 'russland': 'RU', 'russian federation': 'RU',
+    'japan': 'JP', '日本': 'JP', 'nippon': 'JP',
+    'south korea': 'KR', 'korea': 'KR', '대한민국': 'KR', 'republic of korea': 'KR',
+    'china': 'CN', '中国': 'CN', 'peoples republic of china': 'CN',
+    'taiwan': 'TW', '台灣': 'TW', '台湾': 'TW',
+    'australia': 'AU', 'australien': 'AU',
+    'new zealand': 'NZ', 'neuseeland': 'NZ',
+    'canada': 'CA', 'kanada': 'CA',
+    'mexico': 'MX', 'méxico': 'MX', 'mexiko': 'MX',
+    'brazil': 'BR', 'brasil': 'BR', 'brasilien': 'BR',
+    'argentina': 'AR', 'argentinien': 'AR',
+    'chile': 'CL',
+    'colombia': 'CO', 'kolumbien': 'CO',
+    'peru': 'PE',
+    'south africa': 'ZA', 'südafrika': 'ZA', 'sudafrika': 'ZA',
+    'india': 'IN', 'indien': 'IN', 'भारत': 'IN',
+    'thailand': 'TH', 'ประเทศไทย': 'TH',
+    'indonesia': 'ID', 'indonesien': 'ID',
+    'malaysia': 'MY',
+    'singapore': 'SG', 'singapur': 'SG',
+    'philippines': 'PH', 'philippinen': 'PH', 'pilipinas': 'PH',
+    'vietnam': 'VN', 'việt nam': 'VN',
+    'turkey': 'TR', 'türkiye': 'TR', 'turkiye': 'TR', 'türkei': 'TR', 'turkei': 'TR',
+    'greece': 'GR', 'ελλάδα': 'GR', 'ellada': 'GR', 'griechenland': 'GR',
+    'ireland': 'IE', 'éire': 'IE', 'eire': 'IE', 'irland': 'IE',
+    'iceland': 'IS', 'ísland': 'IS', 'island': 'IS',
+    'hungary': 'HU', 'magyarország': 'HU', 'magyarorszag': 'HU', 'ungarn': 'HU',
+    'romania': 'RO', 'românia': 'RO', 'rumänien': 'RO', 'rumanien': 'RO',
+    'bulgaria': 'BG', 'българия': 'BG', 'bulgarien': 'BG',
+    'croatia': 'HR', 'hrvatska': 'HR', 'kroatien': 'HR',
+    'serbia': 'RS', 'србија': 'RS', 'srbija': 'RS', 'serbien': 'RS',
+    'ukraine': 'UA', 'україна': 'UA', 'ukraina': 'UA',
+    'israel': 'IL', 'ישראל': 'IL',
+    'egypt': 'EG', 'مصر': 'EG', 'ägypten': 'EG', 'agypten': 'EG',
+    'morocco': 'MA', 'المغرب': 'MA', 'marokko': 'MA',
+    'united arab emirates': 'AE', 'uae': 'AE',
+    'saudi arabia': 'SA', 'السعودية': 'SA',
+    'mongolia': 'MN', 'монгол': 'MN', 'mongolei': 'MN',
+    'estonia': 'EE', 'eesti': 'EE', 'estland': 'EE',
+    'latvia': 'LV', 'latvija': 'LV', 'lettland': 'LV',
+    'lithuania': 'LT', 'lietuva': 'LT', 'litauen': 'LT',
+    'slovakia': 'SK', 'slovensko': 'SK', 'slowakei': 'SK',
+    'slovenia': 'SI', 'slovenija': 'SI', 'slowenien': 'SI',
+    'luxembourg': 'LU', 'luxemburg': 'LU',
+    'malta': 'MT',
+    'cyprus': 'CY', 'κύπρος': 'CY', 'kypros': 'CY', 'zypern': 'CY',
+  };
+
+  const normalized = lastPart.toLowerCase().trim();
+
+  // Check if it's already a 2-letter code
+  if (lastPart.length === 2 && /^[A-Za-z]{2}$/.test(lastPart)) {
+    return lastPart.toUpperCase();
+  }
+
+  // Look up in mappings
+  if (countryMappings[normalized]) {
+    return countryMappings[normalized];
+  }
+
+  // Return the original last part for backend to resolve
+  return lastPart;
 }
