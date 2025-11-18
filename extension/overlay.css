@@ -1,0 +1,230 @@
+:root {
+  --geo-bg: rgba(10, 12, 24, 0.85);
+  --geo-border: rgba(255, 255, 255, 0.12);
+  --geo-accent: #7c3aed;
+  --geo-text: #f8fafc;
+}
+
+#geoviz-overlay {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  width: 320px;
+  z-index: 2147483647;
+  background: var(--geo-bg);
+  color: var(--geo-text);
+  font-family: "Inter", system-ui, sans-serif;
+  border-radius: 12px;
+  border: 1px solid var(--geo-border);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+}
+
+#geoviz-overlay.minimized .panel,
+#geoviz-overlay.minimized .visual-panel,
+#geoviz-overlay.minimized .map-panel {
+  display: none;
+}
+
+#geoviz-overlay header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--geo-border);
+  font-size: 0.95rem;
+}
+
+#geoviz-overlay header button {
+  border: none;
+  background: transparent;
+  color: var(--geo-text);
+  font-size: 1.2rem;
+  cursor: pointer;
+}
+
+#geoviz-overlay .panel {
+  padding: 1rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+#geoviz-overlay .visual-panel {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--geo-border);
+}
+
+.preview-card {
+  flex: 1.1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.preview-image {
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  overflow: hidden;
+  aspect-ratio: 3 / 1;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+#geoviz-preview {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0.25;
+  transition: opacity 0.2s ease;
+}
+
+.top-countries {
+  flex: 0.9;
+  background: rgba(15, 23, 42, 0.45);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.top-countries h4 {
+  margin: 0;
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.top-countries ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.top-countries li {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.top-countries li strong {
+  color: #4ade80;
+}
+
+.top-countries li.placeholder {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.map-panel {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--geo-border);
+}
+
+#geoviz-map {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  display: block;
+  background: #041207;
+}
+
+.panel.controls {
+  padding-top: 0.75rem;
+}
+
+#geoviz-overlay label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
+#geoviz-overlay input {
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(15, 23, 42, 0.65);
+  color: var(--geo-text);
+  padding: 0.5rem 0.75rem;
+}
+
+#geoviz-overlay .actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+#geoviz-overlay button {
+  flex: 1;
+  border-radius: 999px;
+  border: none;
+  padding: 0.55rem 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  background: linear-gradient(135deg, #6366f1, #a855f7);
+  color: white;
+}
+
+#geoviz-overlay button.ghost {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: var(--geo-text);
+}
+
+#geoviz-overlay .auto-btn {
+  width: 100%;
+  margin-top: 0.5rem;
+  background: rgba(99, 102, 241, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+#geoviz-overlay .auto-btn.active {
+  background: linear-gradient(135deg, #10b981, #14b8a6);
+  border-color: transparent;
+}
+
+#geoviz-status {
+  font-size: 0.85rem;
+  color: #cbd5f5;
+  min-height: 1.4rem;
+}
+
+#geoviz-result {
+  background: rgba(15, 23, 42, 0.55);
+  border-radius: 12px;
+  padding: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+#geoviz-result .grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+#geoviz-result span {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+#geoviz-result strong {
+  font-size: 1rem;
+}
+
+#geoviz-result small {
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+#geoviz-result footer {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.55);
+  margin-top: 0.5rem;
+}

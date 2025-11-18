@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GeoGuessr AI</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>GeoGuessr AI</h1>
+      <label>
+        Backend URL
+        <input id="backendUrl" type="text" placeholder="http://localhost:8000" />
+      </label>
+      <label>
+        Session Prefix
+        <input id="sessionPrefix" type="text" placeholder="chrome-session" />
+      </label>
+      <label class="checkbox-row">
+        <input id="autoPlay" type="checkbox" />
+        <span>Auto-Play aktivieren (5 Runden Loop)</span>
+      </label>
+      <button id="saveBtn">Speichern</button>
+      <p id="status"></p>
+      <p class="hint">
+        Lade die Extension im Developer Mode. Öffne geoguessr.com, das Overlay erscheint automatisch und kann Predictions auslösen.
+      </p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

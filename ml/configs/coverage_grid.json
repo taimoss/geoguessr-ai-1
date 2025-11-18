@@ -1,0 +1,36 @@
+{
+  "name": "geoguessr_coverage_grid",
+  "description": "Simplified coverage grid approximating GeoGuessr's uneven availability. Replace cells with full dataset as needed.",
+  "cells": [
+    {
+      "id": "NA-001",
+      "country": "US",
+      "bounds": [[24.396308, -124.848974], [49.384358, -66.885444]],
+      "centroid": [39.8283, -98.5795]
+    },
+    {
+      "id": "NA-002",
+      "country": "CA",
+      "bounds": [[41.676555, -141.0], [83.6381, -52.323198]],
+      "centroid": [56.1304, -106.3468]
+    },
+    {
+      "id": "EU-001",
+      "country": "GB",
+      "bounds": [[49.906193, -8.649357], [58.635, 1.759]],
+      "centroid": [54.702, -3.276]
+    },
+    {
+      "id": "EU-002",
+      "country": "FR",
+      "bounds": [[41.0, -5.0], [51.5, 9.5]],
+      "centroid": [46.603, 1.888]
+    },
+    {
+      "id": "OC-001",
+      "country": "AU",
+      "bounds": [[-44.0, 112.0], [-9.0, 154.0]],
+      "centroid": [-25.2744, 133.7751]
+    }
+  ]
+}

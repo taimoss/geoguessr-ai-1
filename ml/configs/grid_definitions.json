@@ -1,0 +1,26 @@
+{
+  "grids": [
+    {
+      "name": "s2_level4",
+      "s2_level": 4,
+      "approx_km": 160,
+      "cell_count": 384,
+      "description": "Coarse continental grid used to narrow down hemisphere-scale location."
+    },
+    {
+      "name": "s2_level5",
+      "s2_level": 5,
+      "approx_km": 80,
+      "cell_count": 1536,
+      "description": "Regional grid to distinguish countries and large states."
+    },
+    {
+      "name": "s2_level6",
+      "s2_level": 6,
+      "approx_km": 40,
+      "cell_count": 6144,
+      "description": "Fine grid capturing sub-national structures; aligns with GeoGuessr grid requirements."
+    }
+  ],
+  "hierarchy": ["s2_level4", "s2_level5", "s2_level6"]
+}
