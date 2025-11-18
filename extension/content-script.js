@@ -1559,40 +1559,13 @@ function startNewGameMonitor() {
     // Only act if auto-play or scrape is active
     if (!autoPlayActive && !scrapeActive) return;
 
-    // First check for "View Results" / "Close" button and click it
-    const viewResultsSelectors = [
-      ...SELECTORS.viewResultsButtons,
-      "button[data-qa='close-round-result']",
-      "[data-qa='close-round-result']",
-      "button[class*='close']",
-      "[aria-label*='close' i]",
-      "[aria-label*='View' i]",
-    ];
-    for (const selector of viewResultsSelectors) {
-      const viewResultsBtn = document.querySelector(selector);
-      if (viewResultsBtn && viewResultsBtn.offsetParent !== null) {
-        console.log("[GeoViz] View Results button detected:", selector);
-        viewResultsBtn.click();
-        return;
-      }
-    }
-    // Also check by text
-    const viewResultsText = queryButtonByText(["view results", "close", "continue"]);
-    if (viewResultsText && viewResultsText.offsetParent !== null) {
-      console.log("[GeoViz] View Results button (by text) detected");
-      viewResultsText.click();
-      return;
-    }
-
-    // Then check for "Play Again" button with extended selectors
+    // Check for "Play Again" button FIRST (higher priority)
     const playAgainSelectors = [
-      ...SELECTORS.playAgainButtons,
       "button[data-qa='play-again-button']",
+      ...SELECTORS.playAgainButtons,
       "a[data-qa='play-again']",
       "a[href*='play-again']",
-      "[data-qa*='again']",
-      "[data-qa*='next']",
-      "button[class*='again']",
+      "[data-qa*='play-again']",
       "button[class*='playAgain']",
     ];
 
@@ -1614,7 +1587,7 @@ function startNewGameMonitor() {
     }
 
     // Also check by text for play again
-    const playAgainText = queryButtonByText(["play again", "play next", "new game", "another game"]);
+    const playAgainText = queryButtonByText(["play again"]);
     if (playAgainText && playAgainText.offsetParent !== null) {
       console.log("[GeoViz] Play Again button (by text) detected");
       playAgainText.click();
@@ -1626,6 +1599,22 @@ function startNewGameMonitor() {
       currentSessionId = `${extensionConfig.sessionPrefix || "chrome-session"}-${Date.now()}`;
       const sessionInput = document.getElementById("geoviz-session");
       if (sessionInput) sessionInput.value = currentSessionId;
+      return;
+    }
+
+    // Then check for "View Results" / "Close" button (only specific selectors)
+    const viewResultsSelectors = [
+      "button[data-qa='close-round-result']",
+      "[data-qa='close-round-result']",
+      ...SELECTORS.viewResultsButtons,
+    ];
+    for (const selector of viewResultsSelectors) {
+      const viewResultsBtn = document.querySelector(selector);
+      if (viewResultsBtn && viewResultsBtn.offsetParent !== null) {
+        console.log("[GeoViz] View Results button detected:", selector);
+        viewResultsBtn.click();
+        return;
+      }
     }
   }, 200);
 }
@@ -1658,18 +1647,25 @@ function interceptGeoPhotoService() {
   if (window.__geovizFetchHooked) return;
   window.__geovizFetchHooked = true;
 
+  console.log("[GeoViz] Installing GeoPhotoService interceptors...");
+
   const originalFetch = window.fetch;
   window.fetch = async (...args) => {
     const response = await originalFetch(...args);
     const url = typeof args[0] === "string" ? args[0] : args[0]?.url;
-    if (url && url.includes("GeoPhotoService") && response.clone) {
-      const clone = response.clone();
-      clone
-        .text()
-        .then((body) => {
-          parseGeoPhotoResponse(body);
-        })
-        .catch(() => {});
+    if (url && (url.includes("GeoPhotoService") || url.includes("maps.googleapis.com"))) {
+      console.log("[GeoViz] Fetch intercepted:", url.substring(0, 100));
+      if (response.clone) {
+        const clone = response.clone();
+        clone
+          .text()
+          .then((body) => {
+            parseGeoPhotoResponse(body);
+          })
+          .catch((err) => {
+            console.warn("[GeoViz] Failed to read fetch response:", err);
+          });
+      }
     }
     return response;
   };
@@ -1685,35 +1681,73 @@ function interceptGeoPhotoService() {
       "load",
       () => {
         const url = this.__geovizUrl;
-        if (!url || !String(url).includes("GeoPhotoService")) return;
-        try {
-          parseGeoPhotoResponse(this.responseText);
-        } catch {
-          /* ignore */
+        if (!url) return;
+        if (url.includes("GeoPhotoService") || url.includes("maps.googleapis.com")) {
+          console.log("[GeoViz] XHR intercepted:", url.substring(0, 100));
+          try {
+            parseGeoPhotoResponse(this.responseText);
+          } catch (err) {
+            console.warn("[GeoViz] Failed to parse XHR response:", err);
+          }
         }
       },
       { once: true }
     );
     return originalSend.call(this, body);
   };
+
+  console.log("[GeoViz] GeoPhotoService interceptors installed");
 }
 
 function parseGeoPhotoResponse(body) {
+  if (!body) return;
+
+  let data = null;
+
+  // Try JSONP callback format first
   const callbackPrefix = "/**/_callbacks____";
-  if (!body || !body.startsWith(callbackPrefix)) return;
-  const start = body.indexOf("(");
-  const end = body.lastIndexOf(")");
-  if (start === -1 || end === -1) return;
-  const payload = body.slice(start + 1, end);
-  let data;
-  try {
-    data = JSON.parse(payload);
-  } catch (error) {
+  if (body.startsWith(callbackPrefix)) {
+    const start = body.indexOf("(");
+    const end = body.lastIndexOf(")");
+    if (start !== -1 && end !== -1) {
+      const payload = body.slice(start + 1, end);
+      try {
+        data = JSON.parse(payload);
+      } catch (error) {
+        console.warn("[GeoViz] Failed to parse JSONP callback:", error);
+      }
+    }
+  }
+
+  // Try raw JSON format
+  if (!data) {
+    try {
+      data = JSON.parse(body);
+    } catch {
+      // Not JSON, try to find JSON in the response
+      const jsonMatch = body.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        try {
+          data = JSON.parse(jsonMatch[0]);
+        } catch {
+          // Still no luck
+        }
+      }
+    }
+  }
+
+  if (!data) {
+    console.warn("[GeoViz] Could not parse GeoPhoto response");
     return;
   }
+
+  console.log("[GeoViz] Parsing GeoPhoto data...");
   const meta = extractMetadataFromArray(data);
   if (meta) {
+    console.log("[GeoViz] New coordinates captured:", meta.lat, meta.lon, meta.country);
     latestStreetViewMetadata = meta;
+  } else {
+    console.warn("[GeoViz] No metadata extracted from response");
   }
 }
 
